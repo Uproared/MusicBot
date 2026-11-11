@@ -1049,3 +1049,70 @@ def test_status_shows_live_for_streams(bot_cls, monkeypatch):
     fake, calls = _status_bot({1: _player(stream)})
     _run_status(bot_cls, fake, monkeypatch)
     assert calls[0][1].state == "Radio \u00b7 \U0001f534 Live"
+
+
+# --- the playlist prompt answers after ✅ -------------------------------------------
+
+
+def _prompt_run(bot_cls, play_result=None, play_error=None):
+    sent, deleted, tasks = [], [], []
+    prompt = SimpleNamespace(add_reaction=_noop)
+
+    async def safe_send_message(dest, content):
+        sent.append(content)
+        return prompt
+
+    async def safe_delete_message(msg):
+        deleted.append(msg)
+
+    async def wait_for(_event, timeout, check):
+        return SimpleNamespace(emoji="\u2705", message=prompt), None
+
+    async def cmd_play(*_args, **_kwargs):
+        if play_error is not None:
+            raise play_error
+        return play_result
+
+    fake = SimpleNamespace(
+        config=SimpleNamespace(delete_delay_long=60, embeds=True),
+        safe_send_message=safe_send_message,
+        safe_delete_message=safe_delete_message,
+        wait_for=wait_for,
+        _cmd_play=cmd_play,
+        create_task=lambda coro, name=None: tasks.append(coro),
+    )
+    message = SimpleNamespace(id=5)
+    url = "https://www.youtube.com/watch?v=abcdefghijk&list=OLAK5uy_TestAlbumNotARealListId000000000"
+
+    async def run():
+        await bot_cls._cmd_play_compound_link(
+            fake, None, message, object(), object(), object(), object(), object(),
+            [], url, False,
+        )
+        for coro in tasks:
+            await coro
+
+    asyncio.run(run())
+    return sent[1:], deleted, message  # sent[0] is the prompt itself
+
+
+def test_playlist_prompt_reports_a_refusal(bot_cls):
+    error = exceptions.PermissionsError(
+        "Playlist entries + your already queued songs reached limit (%(max)s)",
+        fmt_args={"max": 8},
+    )
+    replies, deleted, message = _prompt_run(bot_cls, play_error=error)
+    assert len(replies) == 1
+    assert replies[0].author.name == "\u26a0\ufe0f play"
+    assert "reached limit (8)" in replies[0].description
+    assert replies[0].reply_to is message
+    assert len(deleted) == 1  # the prompt is gone either way
+
+
+def test_playlist_prompt_confirms_what_was_added(bot_cls):
+    from musicbot.constructs import Response
+
+    card = Response("", title="Some album")
+    replies, deleted, message = _prompt_run(bot_cls, play_result=card)
+    assert replies == [card] and card.reply_to is message
+    assert len(deleted) == 1
