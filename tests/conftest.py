@@ -79,6 +79,8 @@ def event_loop_thread():
     t = threading.Thread(target=loop.run_forever, daemon=True)
     t.start()
     yield loop
+    # Let calls already handed to the loop (discord.py's speak updates) finish.
+    asyncio.run_coroutine_threadsafe(asyncio.sleep(0.05), loop).result(5)
     loop.call_soon_threadsafe(loop.stop)
     t.join(5)
     loop.close()
