@@ -627,3 +627,59 @@ def test_queue_list_text_mode_has_no_links(bot_cls):
     q = _queue_text(bot_cls, embeds=False)
     assert "](" not in q.description
     assert "`1.` Song B · `03:00` · bob" in q.description
+
+
+# --- DeleteNowPlaying: the card is deleted, not edited ----------------------------
+
+
+def test_deleted_card_is_forgotten_without_an_edit(bot_cls):
+    retired, deleted = [], []
+    card = SimpleNamespace(id=50)
+
+    async def retire(guild, edit=True):
+        retired.append(edit)
+
+    async def safe_delete_message(msg):
+        deleted.append(msg)
+
+    async def run():
+        fake = SimpleNamespace(
+            loop=asyncio.get_running_loop(),
+            logout_called=False,
+            config=SimpleNamespace(
+                enable_queue_history_global=False,
+                enable_queue_history_guilds=False,
+                delete_nowplaying=True,
+                leave_after_queue_empty=True,  # ends the handler right after
+            ),
+            server_data={1: SimpleNamespace(
+                current_playing_url="", last_np_msg=card, np_controls_msg=card,
+            )},
+            _retire_np_controls=retire,
+            safe_delete_message=safe_delete_message,
+            disconnect_voice_client=_noop,
+        )
+        player = SimpleNamespace(
+            voice_client=SimpleNamespace(guild=SimpleNamespace(id=1), is_connected=lambda: True),
+            playlist=_Playlist([]),
+        )
+        await bot_cls.on_player_finished_playing(fake, player)
+
+    asyncio.run(run())
+    assert retired == [False]
+    assert deleted == [card]
+
+
+def test_retire_ignores_an_already_deleted_card(bot_cls, caplog):
+    class _Resp:
+        status = 404
+        reason = "Not Found"
+
+    async def edit(**_kw):
+        raise discord.NotFound(_Resp(), {"code": 10008, "message": "Unknown Message"})
+
+    ssd = SimpleNamespace(np_controls_msg=SimpleNamespace(edit=edit), np_controls_view=_View())
+    fake = SimpleNamespace(server_data={1: ssd})
+    with caplog.at_level("DEBUG", logger="musicbot.bot"):
+        asyncio.run(bot_cls._retire_np_controls(fake, SimpleNamespace(id=1)))
+    assert "Could not remove" not in caplog.text
