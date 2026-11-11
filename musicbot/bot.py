@@ -15,7 +15,7 @@ import sys
 import time
 import uuid
 from collections import defaultdict
-from io import BytesIO, StringIO
+from io import BytesIO
 from typing import TYPE_CHECKING, Any, DefaultDict, Dict, List, Optional, Set, Union
 
 import aiohttp
@@ -88,13 +88,6 @@ from .utils import (
     slugify,
     youtube_playlist_in_link,
 )
-
-# optional imports
-try:
-    import objgraph
-except ImportError:
-    objgraph = None  # type: ignore[assignment]
-
 
 if TYPE_CHECKING:
     from collections.abc import Coroutine
@@ -7681,148 +7674,6 @@ class MusicBot(discord.Client):
         ssd = self.server_data[guild.id]
         log.critical("Activating debug breakpoint ID: %(uuid)s", {"uuid": uid})
         return Response(_D("Logged breakpoint with ID:  %(uuid)s", ssd) % {"uuid": uid})
-
-    @dev_only
-    @command_helper(
-        # fmt: off
-        usage=[
-            "{cmd}\n"
-            + _Dd("    View most common types reported by objgraph.\n"),
-
-            "{cmd} growth\n"
-            + _Dd("    View limited objgraph.show_growth() output.\n"),
-
-            "{cmd} leaks\n"
-            + _Dd("    View most common types of leaking objects.\n"),
-
-            "{cmd} leakstats\n"
-            + _Dd("    View typestats of leaking objects.\n"),
-
-            "{cmd} [objgraph.function(...)]\n"
-            + _Dd("    Evaluate the given function and arguments on objgraph.\n"),
-        ],
-        # fmt: on
-        desc=_Dd(
-            "Interact with objgraph, if it is installed, to gain insight into memory usage.\n"
-            "You can pass an arbitrary method with arguments (but no spaces!) that is a member of objgraph.\n"
-            "Since this method evaluates arbitrary code, it is considered dangerous like the debug command.\n"
-        )
-    )
-    async def cmd_objgraph(
-        self,
-        message: discord.Message,  # pylint: disable=unused-argument
-        channel: MessageableChannel,
-        func: str = "most_common_types()",
-    ) -> CommandResponse:
-        """
-        Interact with objgraph to make it spill the beans.
-        """
-        if not objgraph:
-            raise exceptions.CommandError(
-                "Could not import `objgraph`, is it installed?"
-            )
-
-        await channel.typing()
-
-        data: Any = None
-        if func == "growth":
-            f = StringIO()
-            objgraph.show_growth(limit=10, file=f)
-            f.seek(0)
-            data = f.read()
-            f.close()
-
-        elif func == "leaks":
-            f = StringIO()
-            objgraph.show_most_common_types(
-                objects=objgraph.get_leaking_objects(), file=f
-            )
-            f.seek(0)
-            data = f.read()
-            f.close()
-
-        elif func == "leakstats":
-            data = objgraph.typestats(objects=objgraph.get_leaking_objects())
-
-        else:
-            data = eval("objgraph." + func)  # pylint: disable=eval-used
-
-        return Response(data, codeblock="py")
-
-    @dev_only
-    @command_helper(
-        # fmt: off
-        usage=[
-            "{cmd} [PYCODE]\n",
-        ],
-        # fmt: on
-        desc=_Dd(
-            "This command will execute arbitrary python code in the command scope.\n"
-            "First eval() is attempted, if exceptions are thrown exec() is tried next.\n"
-            "If eval is successful, it's return value is displayed.\n"
-            "If exec is successful, a value can be set to local variable `result` and that value will be returned.\n"
-            "\n"
-            "Multi-line code can be executed if wrapped in code-block.\n"
-            "Otherwise only a single line may be executed.\n"
-            "\n"
-            "This command may be removed in a future version, and is used by developers to debug MusicBot behaviour.\n"
-            "The danger of this command cannot be understated. Do not use it or give access to it if you do not understand the risks!\n"
-        ),
-    )
-    async def cmd_debug(
-        self,
-        _player: Optional[MusicPlayer],
-        message: discord.Message,  # pylint: disable=unused-argument
-        channel: GuildMessageableChannels,  # pylint: disable=unused-argument
-        guild: discord.Guild,  # pylint: disable=unused-argument
-        author: discord.Member,  # pylint: disable=unused-argument
-        permissions: PermissionGroup,  # pylint: disable=unused-argument
-        *,
-        data: str,
-    ) -> CommandResponse:
-        """
-        Command for debugging MusicBot in real-time.
-        It is dangerous and should maybe be removed in later versions...
-        """
-        codeblock = "```py\n{}\n```"
-        result = None
-
-        if data.startswith("```") and data.endswith("```"):
-            code = "\n".join(data.lstrip("`").rstrip("`\n").split("\n")[1:])
-        else:
-            code = data.strip("` \n")
-
-        try:
-            run_type = "eval"
-            result = eval(code)  # pylint: disable=eval-used
-            log.debug("Debug code ran with eval().")
-        except Exception:  # pylint: disable=broad-exception-caught
-            try:
-                run_type = "exec"
-                # exec needs a fake locals so we can get `result` from it.
-                lscope: Dict[str, Any] = {}
-                # exec also needs locals() to be in globals() for access to work.
-                gscope = globals().copy()
-                gscope.update(locals().copy())
-                exec(code, gscope, lscope)  # pylint: disable=exec-used
-                log.debug("Debug code ran with exec().")
-                result = lscope.get("result", result)
-            except Exception as e:
-                log.exception("Debug code failed to execute.")
-                raise exceptions.CommandError(
-                    "Failed to execute debug code:\n%(py_code)s\n"
-                    "Exception: ```\n%(ex_name)s:\n%(ex_text)s```",
-                    fmt_args={
-                        "py_code": codeblock.format(code),
-                        "ex_name": type(e).__name__,
-                        "ex_text": e,
-                    },
-                ) from e
-
-        if asyncio.iscoroutine(result):
-            result = await result
-
-        return Response(f"**{run_type}() Result:**\n{codeblock.format(result)}")
 
     @dev_only
     @command_helper(
