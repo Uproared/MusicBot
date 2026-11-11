@@ -52,9 +52,6 @@ from .constants import (
     EMOJI_RESTART_FULL,
     EMOJI_RESTART_SOFT,
     EMOJI_STOP_SIGN,
-    EMOJI_UPDATE_ALL,
-    EMOJI_UPDATE_GIT,
-    EMOJI_UPDATE_PIP,
     EXAMPLE_OPTIONS_FILE,
     EXAMPLE_PERMS_FILE,
     FALLBACK_PING_SLEEP,
@@ -7408,18 +7405,11 @@ class MusicBot(discord.Client):
             + _Dd("    Attempt to reload without process restart. The default option.\n"),
             "{cmd} full\n"
             + _Dd("    Attempt to restart the entire MusicBot process, reloading everything.\n"),
-            "{cmd} uppip\n"
-            + _Dd("    Full restart, but attempt to update pip packages before restart.\n"),
-            "{cmd} upgit\n"
-            + _Dd("    Full restart, but update MusicBot source code with git first.\n"),
-            "{cmd} upgrade\n"
-            + _Dd("    Attempt to update all dependency and source code before fully restarting.\n"),
         ],
         # fmt: on
         desc=_Dd(
             "Attempts to restart the MusicBot in a number of different ways.\n"
             "With no option supplied, a `soft` restart is implied.\n"
-            "It can be used to remotely update a MusicBot installation, but should be used with care.\n"
             "If you have a service manager, we recommend using it instead of this command for restarts.\n"
         ),
     )
@@ -7432,13 +7422,14 @@ class MusicBot(discord.Client):
     ) -> CommandResponse:
         """
         Usage:
-            {command_prefix}restart [soft|full|upgrade|upgit|uppip]
+            {command_prefix}restart [soft|full]
         """
-        # TODO:  move the update stuff to its own command, including update check.
+        # The uppip/upgit/upgrade options were removed in this fork: running
+        # `pip install -U` from the bot can pull a broken davey (see requirements.txt).
         opt = opt.strip().lower()
-        if opt not in ["soft", "full", "upgrade", "uppip", "upgit"]:
+        if opt not in ["soft", "full"]:
             raise exceptions.CommandError(
-                "Invalid option given, use one of:  soft, full, upgrade, uppip, or upgit"
+                "Invalid option given, use one of:  soft or full"
             )
 
         out_msg = ""
@@ -7452,21 +7443,6 @@ class MusicBot(discord.Client):
                 "%(emoji)s Restarting bot process...",
                 self.server_data[guild.id],
             ) % {"emoji": EMOJI_RESTART_FULL}
-        elif opt == "uppip":
-            out_msg = _D(
-                "%(emoji)s Will try to upgrade required pip packages and restart the bot...",
-                self.server_data[guild.id],
-            ) % {"emoji": EMOJI_UPDATE_PIP}
-        elif opt == "upgit":
-            out_msg = _D(
-                "%(emoji)s Will try to update bot code with git and restart the bot...",
-                self.server_data[guild.id],
-            ) % {"emoji": EMOJI_UPDATE_GIT}
-        elif opt == "upgrade":
-            out_msg = _D(
-                "%(emoji)s Will try to upgrade everything and restart the bot...",
-                self.server_data[guild.id],
-            ) % {"emoji": EMOJI_UPDATE_ALL}
 
         await self.safe_send_message(channel, Response(out_msg))
 
@@ -7479,21 +7455,6 @@ class MusicBot(discord.Client):
 
         if opt == "full":
             raise exceptions.RestartSignal(code=exceptions.RestartCode.RESTART_FULL)
-
-        if opt == "upgrade":
-            raise exceptions.RestartSignal(
-                code=exceptions.RestartCode.RESTART_UPGRADE_ALL
-            )
-
-        if opt == "uppip":
-            raise exceptions.RestartSignal(
-                code=exceptions.RestartCode.RESTART_UPGRADE_PIP
-            )
-
-        if opt == "upgit":
-            raise exceptions.RestartSignal(
-                code=exceptions.RestartCode.RESTART_UPGRADE_GIT
-            )
 
         return None
 

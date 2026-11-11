@@ -102,9 +102,6 @@ class RetryConfigException(Exception):
 class RestartCode(Enum):
     RESTART_SOFT = 0
     RESTART_FULL = 1
-    RESTART_UPGRADE_ALL = 2
-    RESTART_UPGRADE_PIP = 3
-    RESTART_UPGRADE_GIT = 4
 
 
 # Base class for control signals

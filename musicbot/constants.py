@@ -162,6 +162,3 @@ EMOJI_NEXT_ICON: str = "\u23e9"  # fast-forward button
 EMOJI_PREV_ICON: str = "\u23ea"  # rewind button
 EMOJI_RESTART_SOFT: str = "\u21a9\ufe0f"  # Right arrow curving left
 EMOJI_RESTART_FULL: str = "\U0001f504"  # counterclockwise arrows
-EMOJI_UPDATE_PIP: str = "\U0001f4e6"  # package / box
-EMOJI_UPDATE_GIT: str = "\U0001f5c3\ufe0f"  # card box
-EMOJI_UPDATE_ALL: str = "\U0001f310"  # globe with meridians

@@ -32,7 +32,6 @@ from musicbot.constants import (
 from musicbot.constants import VERSION as BOTVERSION
 from musicbot.exceptions import (
     HelpfulError,
-    RestartCode,
     RestartSignal,
     TerminateSignal,
 )
@@ -147,28 +146,6 @@ class GIT:
         except (OSError, ValueError, subprocess.CalledProcessError):
             return ("", "")
 
-    @classmethod
-    def run_upgrade_pull(cls) -> None:
-        """Runs `git pull` in the current working directory."""
-        cls.works(raise_instead=True)
-
-        log.info("Attempting to upgrade with `git pull` on current path.")
-        try:
-            git_bin = shutil.which("git")
-            if not git_bin:
-                raise FileNotFoundError("Could not locate `git` executable on path.")
-            raw_data = subprocess.check_output([git_bin, "pull"])
-            git_data = raw_data.decode("utf8").strip()
-            log.info("Result of git pull:  %s", git_data)
-        except (
-            OSError,
-            UnicodeError,
-            PermissionError,
-            FileNotFoundError,
-            subprocess.CalledProcessError,
-        ):
-            log.exception("Upgrade failed, you need to run `git pull` manually.")
-
 
 class PIP:
     @classmethod
@@ -266,76 +243,6 @@ class PIP:
             log.warning("Could not decode pip update report JSON.")
 
         return []
-
-    @classmethod
-    def run_upgrade_requirements(
-        cls,
-        get_output: bool = False,
-        quiet: bool = True,
-    ) -> Union[str, int]:
-        """
-        Uses a subprocess call to run python using sys.executable.
-        Runs `pip install --no-warn-script-location --no-input -U -r ./requirements.txt`
-        This method attempts to catch all exceptions and ensure a return value.
-
-        :param: get_output:  Return the process output rather than its exit code.
-            If set True, and an exception is caught, this will return the string "[[ProcessException]]"
-            If set False and an exception is caught, this will return int -255
-
-        :returns:  process exit code, where 0 is assumed success.
-        """
-        if not cls.works():
-            raise RuntimeError(_L("Cannot locate or execute python -m pip"))
-
-        log.info(
-            "Attempting to upgrade with `%s` on current path...",
-            "pip install --upgrade -r requirements.txt",
-        )
-        try:
-            raw_data = cls.run_python_m(
-                [
-                    "install",
-                    "--no-warn-script-location",
-                    "--no-input",
-                    "-U",
-                    "-r",
-                    "requirements.txt",
-                ],
-                check_output=get_output,
-                quiet=quiet,
-            )
-            if isinstance(raw_data, bytes):
-                pip_data = raw_data.decode("utf8").strip()
-                log.info("Result of pip upgrade:\n%s", pip_data)
-                if get_output:
-                    return pip_data
-
-            if isinstance(raw_data, int):
-                log.info("Result exit code from pip upgrade: %s", raw_data)
-                return raw_data
-
-            # if somehow raw_data is not int or bytes.
-            if get_output:
-                return "[[OutputTypeException]]"
-            return -255
-        except (
-            PermissionError,
-            FileNotFoundError,
-            OSError,
-            UnicodeError,
-            subprocess.CalledProcessError,
-        ):
-            log.exception(
-                "Upgrade failed to execute or we could not understand the output"
-            )
-            log.warning(
-                "You may need to run `%s` manually.",
-                "pip install --upgrade -r requirements.txt",
-            )
-
-            if get_output:
-                return "[[ProcessException]]"
-            return -255
 
 
 def bugger_off(msg: str = _L("Press enter to continue . . ."), code: int = 1) -> None:
@@ -805,14 +712,13 @@ def parse_cli_args() -> argparse.Namespace:
         help=_L("Skip only the update check at startup."),
     )
 
-    # Disable dependency install on error option.
+    # Kept so existing launch commands and service units still parse.
+    # Dependencies are never installed automatically any more.
     ap.add_argument(
         "--no-install-deps",
         dest="no_install_deps",
         action="store_true",
-        help=_L(
-            "Disable MusicBot from trying to install dependencies when it cannot import them."
-        ),
+        help=_L("Ignored. MusicBot no longer installs dependencies by itself."),
     )
 
     # Log related options.
@@ -1128,7 +1034,6 @@ def main() -> None:
 
     exit_signal: Union[RestartSignal, TerminateSignal, None] = None
     event_loop: Optional[asyncio.AbstractEventLoop] = None
-    tried_requirementstxt: bool = False
     use_certifi: bool = False
     retries: int = 0
     max_wait_time: int = 60
@@ -1229,85 +1134,21 @@ def main() -> None:
                 if "module 'discord'" not in str(e):
                     raise
 
-            if cli_args.no_install_deps:
-                log.error(
-                    # fmt: off
-                    "Cannot start MusicBot due to an error!\n"
-                    "\n"
-                    "Problem:\n"
-                    "  There was an error importing MusicBot or a dependency package.\n"
-                    "\n"
-                    "Solution:\n"
-                    "  You need to manually install pip packages for MusicBot\n"
-                    "  or launch without `--no-install-deps` and MusicBot will try to install them for you."
-                    # fmt: on
-                )
-                break
-
-            if not PIP.works():
-                log.critical(
-                    (
-                        "MusicBot could not import dependency modules and we cannot run `pip` automatically!\n"
-                        "You will need to manually install `pip` package for your version of python.\n"
-                    )
-                )
-                log.warning(
-                    (
-                        "If you already installed `pip` but still get this error:\n"
-                        " - Check that you installed it for this python version: %s\n"
-                        " - Check installed packages are accessible to the user running MusicBot"
-                    ),
-                    sys.version.split(maxsplit=1)[0],
-                )
-                break
-
-            if not tried_requirementstxt:
-                tried_requirementstxt = True
-
-                log.info(
-                    "Attempting to install MusicBot dependency packages automatically...\n"
-                )
-                pip_exit_code = PIP.run_upgrade_requirements(quiet=False)
-
-                # If pip ran without issue, it should return 0 status code.
-                if pip_exit_code:
-                    print()
-                    log.critical(
-                        # fmt: off
-                        "MusicBot dependencies may not be installed!\n"
-                        "\n"
-                        "Problem:\n"
-                        "  The pip install process ended with a possible error.\n"
-                        "  Some or all of the the dependencies may be missing.\n"
-                        "\n"
-                        "Solution:\n"
-                        "  You must manually install dependency packages.\n"
-                        "  Open a CMD prompt / terminal to the MusicBot directory.\n"
-                        "  You can try using the update scripts install packages.\n"
-                        "  Or try this manual command:\n"
-                        "    %(py_bin)s -m pip install -U -r ./requirements.txt\n"
-                        "\n"
-                        "You can also ask for help in MusicBot's support discord:\n"
-                        "  https://discord.gg/bots",
-                        # fmt: on
-                        {"py_bin": sys.executable}
-                    )
-                    break
-
-                print()
-                log.info("OK, lets hope installing dependencies worked!")
-                print()
-
-                retries += 1
-                continue
-
-            if tried_requirementstxt and retries >= 1:
-                exit_signal = RestartSignal(RestartCode.RESTART_FULL)
-                retries += 1
-                break
-
-            retries = 0
-            exit_signal = TerminateSignal(exit_code=1)
+            # This fork never runs pip by itself (it used to `pip install -U` here,
+            # which can pull a broken davey; see requirements.txt). Install by hand.
+            log.error(
+                # fmt: off
+                "Cannot start MusicBot due to an error!\n"
+                "\n"
+                "Problem:\n"
+                "  There was an error importing MusicBot or a dependency package.\n"
+                "\n"
+                "Solution:\n"
+                "  Install the pip packages for MusicBot manually, for example:\n"
+                "    %(py_bin)s -m pip install -r requirements.txt",
+                # fmt: on
+                {"py_bin": sys.executable},
+            )
             break
 
         except HelpfulError as e:
@@ -1358,16 +1199,6 @@ def main() -> None:
     if exit_signal:
         if isinstance(exit_signal, RestartSignal):
             if exit_signal.get_name() == "RESTART_FULL":
-                respawn_bot_process()
-            elif exit_signal.get_name() == "RESTART_UPGRADE_ALL":
-                PIP.run_upgrade_requirements()
-                GIT.run_upgrade_pull()
-                respawn_bot_process()
-            elif exit_signal.get_name() == "RESTART_UPGRADE_PIP":
-                PIP.run_upgrade_requirements()
-                respawn_bot_process()
-            elif exit_signal.get_name() == "RESTART_UPGRADE_GIT":
-                GIT.run_upgrade_pull()
                 respawn_bot_process()
         elif isinstance(exit_signal, TerminateSignal):
             sys.exit(exit_signal.exit_code)
