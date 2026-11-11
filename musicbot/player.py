@@ -1,5 +1,6 @@
 import asyncio
 import functools
+import gc
 import json
 import logging
 import os
@@ -162,6 +163,22 @@ LATE_PACKET_GAP = 0.060
 LATE_PACKET_MAX = 2.0
 LATE_PACKET_LOG_EVERY = 5.0  # at most one line per track this often
 
+# Total time spent in garbage collection, so a late-packet line can say how
+# much of the gap was a collection (nothing else runs during one).
+# [total seconds, start of the current collection]
+_GC_TIME = [0.0, 0.0]
+_gc_clock = time.perf_counter
+
+
+def _time_gc(phase: str, _info: Dict[str, Any]) -> None:
+    if phase == "start":
+        _GC_TIME[1] = _gc_clock()
+    else:
+        _GC_TIME[0] += _gc_clock() - _GC_TIME[1]
+
+
+gc.callbacks.append(_time_gc)
+
 
 class SourcePlaybackCounter(AudioSource):
     def __init__(
@@ -191,6 +208,7 @@ class SourcePlaybackCounter(AudioSource):
         self._error: Optional[Exception] = None
         self._label = label
         self._last_read: Optional[float] = None
+        self._gc_at_last_read: float = 0.0
         self._late_count: int = 0
         self._late_worst: float = 0.0
         self._late_logged_at: float = float("-inf")
@@ -200,10 +218,11 @@ class SourcePlaybackCounter(AudioSource):
         return self._is_opus_audio
 
     def read(self) -> bytes:
+        started = time.perf_counter()
         res = self._source.read()
         if res:
             self._num_reads += 1
-            self._check_packet_timing()
+            self._check_packet_timing(started)
         else:
             if self._error is None:
                 self._error = self._check_ffmpeg_exit()
@@ -214,10 +233,12 @@ class SourcePlaybackCounter(AudioSource):
         """Forget the last read, so a pause isn't logged as a late packet."""
         self._last_read = None
 
-    def _check_packet_timing(self) -> None:
-        """Runs on the audio thread for every packet: one clock reading."""
+    def _check_packet_timing(self, read_started: float) -> None:
+        """Runs on the audio thread for every packet: two clock readings."""
         now = time.perf_counter()
         last, self._last_read = self._last_read, now
+        gc_total, gc_before = _GC_TIME[0], self._gc_at_last_read
+        self._gc_at_last_read = gc_total
         if last is None:
             return
         gap = now - last
@@ -228,14 +249,20 @@ class SourcePlaybackCounter(AudioSource):
         if now - self._late_logged_at >= LATE_PACKET_LOG_EVERY:
             self._late_logged_at = now
             pos = self.progress
+            # A slow read points at ffmpeg; a long collection at Python's
+            # garbage collector. If neither covers the gap, the audio thread
+            # was waiting for another thread (the GIL) or for the OS.
             log.info(
                 "Late audio packet: %(gap)d ms after the previous one (normal: 20 ms) "
-                "at %(min)d:%(sec)02d in `%(title)s`.",
+                "at %(min)d:%(sec)02d in `%(title)s`. Within that: ffmpeg read "
+                "%(read)d ms, garbage collection %(gc)d ms.",
                 {
                     "gap": round(gap * 1000),
                     "min": pos // 60,
                     "sec": pos % 60,
                     "title": self._label,
+                    "read": round((now - read_started) * 1000),
+                    "gc": round((gc_total - gc_before) * 1000),
                 },
             )
 
