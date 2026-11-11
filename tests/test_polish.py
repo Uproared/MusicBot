@@ -612,6 +612,8 @@ def _queue_text(bot_cls, embeds):
     fake = SimpleNamespace(
         config=SimpleNamespace(embeds=embeds, queue_length=10, delete_delay_long=60),
         safe_send_message=safe_send_message,
+        server_data={1: SimpleNamespace(queue_msg=None)},
+        aiolocks=collections.defaultdict(asyncio.Lock),
     )
     asyncio.run(bot_cls.cmd_queue(fake, None, SimpleNamespace(id=1), object(), player))
     return sent[0]
@@ -1176,3 +1178,45 @@ def test_reconnect_keeps_the_existing_card(bot_cls):
     sent, ssd, cur = _replay_run(bot_cls, controls_msg=SimpleNamespace(id=10))
     assert sent == []
     assert ssd.np_controls_entry is cur
+
+
+# --- only one queue message -----------------------------------------------------------
+
+
+def test_a_new_queue_replaces_the_old_one(bot_cls, caplog):
+    class _Resp:
+        status = 404
+        reason = "Not Found"
+
+    deleted, sent = [], []
+
+    async def delete_ok():
+        deleted.append("old")
+
+    async def delete_gone():
+        raise discord.NotFound(_Resp(), {"code": 10008, "message": "Unknown Message"})
+
+    async def safe_send_message(_dest, _content):
+        msg = SimpleNamespace(id=len(sent) + 100)
+        sent.append(msg)
+        return msg
+
+    player = _player(_entry("Song A"), queued=[_entry("Song B")])
+    ssd = SimpleNamespace(queue_msg=SimpleNamespace(id=1, delete=delete_ok))
+    fake = SimpleNamespace(
+        config=SimpleNamespace(embeds=True, queue_length=10, delete_delay_long=60),
+        safe_send_message=safe_send_message,
+        server_data={1: ssd},
+        aiolocks=collections.defaultdict(asyncio.Lock),
+    )
+    guild = SimpleNamespace(id=1)
+    asyncio.run(bot_cls.cmd_queue(fake, None, guild, object(), player))
+    assert deleted == ["old"]
+    assert ssd.queue_msg is sent[0]
+
+    # The previous one already timed out or was deleted by hand: no warning.
+    ssd.queue_msg = SimpleNamespace(id=2, delete=delete_gone)
+    with caplog.at_level("WARNING"):
+        asyncio.run(bot_cls.cmd_queue(fake, None, guild, object(), player))
+    assert ssd.queue_msg is sent[1]
+    assert "Cannot delete" not in caplog.text
