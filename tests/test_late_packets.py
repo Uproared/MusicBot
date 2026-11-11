@@ -16,6 +16,8 @@ from musicbot.player import MusicPlayer, MusicPlayerState, SourcePlaybackCounter
 def no_real_gc(monkeypatch):
     """Real collections during a test would add to the reported GC time."""
     monkeypatch.setattr(player_mod, "_GC_TIME", [0.0, 0.0])
+    # These tests call read() on the test runner's thread; leave its priority.
+    monkeypatch.setattr(player_mod, "_raise_audio_thread_priority", lambda: None)
     was_enabled = gc.isenabled()
     gc.disable()
     yield
