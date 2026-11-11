@@ -162,3 +162,37 @@ def test_ffmpeg_error_does_not_edit_autoplaylist_file(error, expect_file_update)
         MusicBot.on_player_error(fake_bot, player=player, entry=ap_entry, ex=error)
     )
     assert calls == [(error, expect_file_update)]
+
+
+def test_no_now_playing_message_for_a_track_that_already_ended():
+    """A failed track got "Playback failed", then a late "Now playing" for it."""
+    from musicbot.bot import MusicBot  # heavy import, only for this test
+
+    calls = []
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    async def send(*args, **_kwargs):
+        calls.append(("send", args))
+
+    guild = SimpleNamespace(id=1)
+    fake_bot = SimpleNamespace(
+        server_data={1: SimpleNamespace()},
+        config=SimpleNamespace(write_current_song=False),
+        _handle_guild_auto_pause=noop,
+        reset_player_inactivity=noop,
+        update_now_playing_status=noop,
+        serialize_queue=noop,
+        safe_send_message=send,
+    )
+    ended = SimpleNamespace(channel=object(), author=object(), title="t", url="u")
+    player = SimpleNamespace(
+        voice_client=SimpleNamespace(channel=SimpleNamespace(guild=guild), guild=guild),
+        skip_state=SimpleNamespace(reset=lambda: None),
+        skip=lambda: calls.append(("skip",)),
+        current_entry=None,  # the track already ended (or failed) during the awaits
+    )
+
+    asyncio.run(MusicBot.on_player_play(fake_bot, player=player, entry=ended))
+    assert calls == []

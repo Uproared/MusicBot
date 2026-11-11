@@ -1068,6 +1068,13 @@ class MusicBot(discord.Client):
         if self.config.write_current_song:
             await self.write_current_song(player.voice_client.channel.guild, entry)
 
+        # The awaits above can take seconds (the status update sleeps under a
+        # lock). If the track already ended or failed, don't announce it as
+        # playing, and don't skip-when-absent, which would skip the next track.
+        if player.current_entry is not entry:
+            log.debug("Track ended before its now-playing message:  %r", entry)
+            return
+
         if entry.channel and entry.author:
             author_perms = self.permissions.for_user(entry.author)
 
