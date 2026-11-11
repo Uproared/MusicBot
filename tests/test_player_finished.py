@@ -32,8 +32,9 @@ class FakePlaylist:
         return self
 
 
-def make_player(loop, *queued, save_videos=True):
-    player = MusicPlayer(FakeBot(loop, save_videos), SimpleNamespace(), FakePlaylist(*queued))
+def make_player(loop, *queued, save_videos=True, connected=True):
+    voice = SimpleNamespace(is_connected=lambda: connected)
+    player = MusicPlayer(FakeBot(loop, save_videos), voice, FakePlaylist(*queued))
     events = []
     player.on("error", lambda **kw: events.append(("error", kw["entry"])))
     player.on("finished-playing", lambda **kw: events.append(("finished", kw["entry"])))
