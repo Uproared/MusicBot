@@ -7497,6 +7497,7 @@ class MusicBot(discord.Client):
 
         return None
 
+    @owner_only
     @command_helper(
         desc=_Dd("Disconnect from all voice channels and close the MusicBot process.")
     )
@@ -7520,6 +7521,7 @@ class MusicBot(discord.Client):
         await self.disconnect_all_voice_clients()
         raise exceptions.TerminateSignal()
 
+    @owner_only
     @command_helper(
         # fmt: off
         usage=[
