@@ -148,8 +148,11 @@ MUSICBOT_CONFIG_SECTIONS_ORDERED: List[str] = [
 ]
 
 # Embed specifics
-MUSICBOT_EMBED_COLOR_NORMAL: str = "#7289DA"
-MUSICBOT_EMBED_COLOR_ERROR: str = "#CC0000"
+# Discord's own palette (polish): blurple, green, amber (its "idle"), red.
+MUSICBOT_EMBED_COLOR_NORMAL: str = "#5865F2"
+MUSICBOT_EMBED_COLOR_PLAYING: str = "#57F287"
+MUSICBOT_EMBED_COLOR_PAUSED: str = "#F0B232"
+MUSICBOT_EMBED_COLOR_ERROR: str = "#ED4245"
 
 
 EMOJI_CHECK_MARK_BUTTON: str = "\u2705"

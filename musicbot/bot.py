@@ -45,7 +45,6 @@ from .constants import (
     DISCORD_MSG_CHAR_LIMIT,
     EMOJI_CHECK_MARK_BUTTON,
     EMOJI_CROSS_MARK_BUTTON,
-    EMOJI_IDLE_ICON,
     EMOJI_NEXT_ICON,
     EMOJI_PREV_ICON,
     EMOJI_RESTART_FULL,
@@ -55,6 +54,8 @@ from .constants import (
     EXAMPLE_PERMS_FILE,
     FALLBACK_PING_SLEEP,
     FALLBACK_PING_TIMEOUT,
+    MUSICBOT_EMBED_COLOR_PAUSED,
+    MUSICBOT_EMBED_COLOR_PLAYING,
     MUSICBOT_USER_AGENT_AIOHTTP,
     MUSICBOT_VOICE_MAX_KBITRATE,
 )
@@ -71,6 +72,26 @@ from .logs import muffle_discord_console_log, mute_discord_console_log
 from .opus_loader import check_davey_version, load_opus_lib
 from .permissions import PermissionGroup, Permissions, PermissionsDefaults
 from .player import MusicPlayer
+from .player_ui import (
+    BUTTON_PAUSE_RESUME,
+    BUTTON_QUEUE,
+    BUTTON_REPEAT,
+    BUTTON_SHUFFLE,
+    BUTTON_SKIP,
+    EMOJI_LIVE,
+    EMOJI_NOTES,
+    EMOJI_PAUSE,
+    EMOJI_PLAY,
+    EMOJI_QUEUE,
+    EMOJI_REPEAT,
+    EMOJI_REPEAT_ONE,
+    EMOJI_SHUFFLE,
+    EMOJI_SKIP,
+    PlayerControls,
+    link_text,
+    progress_bar,
+    short_version,
+)
 from .playlist import Playlist
 from .spotify import Spotify
 from .startup_checks import run_startup_checks
@@ -281,6 +302,10 @@ class MusicBot(discord.Client):
 
     async def setup_hook(self) -> None:
         """async init phase that is called by d.py before login."""
+        # Player buttons: one persistent view handles presses on any card,
+        # including cards sent before a restart (polish).
+        self.add_view(PlayerControls(self))
+
         if self.config.enable_queue_history_global:
             await self.playlist_mgr.global_history.load()
 
@@ -1134,6 +1159,7 @@ class MusicBot(discord.Client):
             log.debug("Track ended before its now-playing message:  %r", entry)
             return
 
+        skipping_absent = False
         if entry.channel and entry.author:
             author_perms = self.permissions.for_user(entry.author)
 
@@ -1158,6 +1184,7 @@ class MusicBot(discord.Client):
                 ):
                     self.server_data[guild.id].current_playing_url = ""
 
+                skipping_absent = True
                 player.skip()
             elif self.config.now_playing_mentions:
                 newmsg = _D(
@@ -1242,24 +1269,13 @@ class MusicBot(discord.Client):
         if self.config.delete_nowplaying:
             auto_delete_np = self.config.delete_delay_short
 
-        content = Response("", delete_after=auto_delete_np)
-        if entry.thumbnail_url:
-            content.set_image(url=entry.thumbnail_url)
+        # The skip-when-absent notice stays a plain message; a playing song
+        # gets the card with the player buttons (polish).
+        if skipping_absent:
+            content = Response(newmsg, delete_after=auto_delete_np)
         else:
-            log.warning(
-                "No thumbnail set for entry with URL: %s",
-                entry.url,
-            )
-
-        if len(entry.url) <= 1024:
-            # TRANSLATORS:  URL field title for embeds.
-            content.add_field(name=_D("URL:", ssd_), value=entry.url, inline=False)
-
-        if self.config.now_playing_mentions:
-            content.title = None
-            content.add_field(name="\n", value=newmsg, inline=True)
-        else:
-            content.title = newmsg
+            content = self._np_card(player, entry, ssd_, delete_after=auto_delete_np)
+            content.view = PlayerControls(self, player)
 
         # send it in specified channel
         if not np_channel:
@@ -1283,10 +1299,11 @@ class MusicBot(discord.Client):
                 player.current_entry.url
             )
 
-        self.server_data[guild.id].last_np_msg = await self.safe_send_message(
-            np_channel,
-            content,
-        )
+        # Only the newest card keeps buttons.
+        await self._retire_np_controls(guild)
+        msg = await self.safe_send_message(np_channel, content)
+        self.server_data[guild.id].last_np_msg = msg
+        self._track_np_controls(guild, msg, content.view)
 
         # TODO: Check channel voice state?
 
@@ -1301,6 +1318,8 @@ class MusicBot(discord.Client):
         """
         log.debug("Running on_player_resume")
         await self.reset_player_inactivity(player)
+        # Buttons first: the status update can hold its lock for 4 s.
+        await self.refresh_np_controls(player.voice_client.guild)
         await self.update_now_playing_status()
 
     async def on_player_pause(
@@ -1313,6 +1332,7 @@ class MusicBot(discord.Client):
         Event called by MusicPlayer when the player enters paused state.
         """
         log.debug("Running on_player_pause")
+        await self.refresh_np_controls(player.voice_client.guild)
         await self.update_now_playing_status()
 
         # save current entry progress, if it played "enough" to merit saving.
@@ -1764,9 +1784,10 @@ class MusicBot(discord.Client):
                 if self.config.status_message:
                     text = format_status_msg(player)
 
+                # "Listening to <song>" (polish). It was a Streaming activity,
+                # which Discord showed wrongly (e.g. as a Twitch link).
                 activity = discord.Activity(
-                    type=discord.ActivityType.streaming,
-                    url=player.current_entry.url,
+                    type=discord.ActivityType.listening,
                     name=text,
                 )
 
@@ -1778,7 +1799,8 @@ class MusicBot(discord.Client):
                     player = p
                     break
             if player and player.current_entry:
-                text = player.current_entry.title.strip()[:128]
+                title = player.current_entry.title.strip()
+                text = f"{EMOJI_PAUSE} Paused: {title}"[:128]
                 if self.config.status_message:
                     text = format_status_msg(player)
 
@@ -1791,7 +1813,7 @@ class MusicBot(discord.Client):
 
         # nothing going on.
         else:
-            text = f" ~ {EMOJI_IDLE_ICON} ~ "
+            text = f"Nothing playing · {self.config.command_prefix}play"
             if self.config.status_message:
                 text = format_status_msg(None)
 
@@ -1889,6 +1911,383 @@ class MusicBot(discord.Client):
 
     #######################################################################################################################
 
+    def _footer(self) -> Dict[str, str]:
+        """
+        Embed footer (polish): the bot's own name and avatar, plus a short
+        version like 'fixes@102dd12'. CustomEmbedFooter replaces the text.
+        """
+        name = DEFAULT_BOT_NAME
+        icon = DEFAULT_BOT_ICON
+        if self.user:
+            name = self.user.name
+            icon = self.user.display_avatar.url
+        text = f"{name} · {short_version(BOTVERSION)}"
+        # A blank CustomEmbedFooter reads back as its default, the old
+        # Just-Some-Bots text (getstr), so that value means "not set".
+        if self.config.footer_text and self.config.footer_text != DEFAULT_FOOTER_TEXT:
+            text = self.config.footer_text
+        return {"text": text, "icon_url": icon}
+
+    def _np_card(
+        self,
+        player: MusicPlayer,
+        entry: EntryTypes,
+        ssd_: Optional[GuildSpecificData],
+        *,
+        with_progress: bool = False,
+        delete_after: Union[None, int, float] = None,
+    ) -> Response:
+        """
+        The now-playing card (polish). The title links to the song, then the
+        uploader, then fields for duration, requester and what's next.
+        `np` adds a progress bar.
+        """
+        paused = player.is_paused
+        streaming = isinstance(entry, StreamPlaylistEntry)
+
+        lines = []
+        uploader = entry.info.get("uploader") or entry.info.get("channel")
+        if uploader:
+            lines.append(str(uploader))
+        if with_progress:
+            progress = format_song_duration(player.progress)
+            if streaming or entry.duration is None:
+                lines.append(f"{EMOJI_LIVE} `{progress}`")
+            else:
+                lines.append(
+                    f"`{progress}` "
+                    f"{progress_bar(player.progress, entry.duration_td.total_seconds())}"
+                    f" `{format_song_duration(entry.duration_td)}`"
+                )
+        if player.repeatsong:
+            lines.append(f"{EMOJI_REPEAT_ONE} " + _D("Repeating this song", ssd_))
+        elif player.loopqueue:
+            lines.append(f"{EMOJI_REPEAT} " + _D("Repeating the queue", ssd_))
+
+        url = entry.url if entry.url.startswith(("http://", "https://")) else None
+        card = Response(
+            "\n".join(lines),
+            title=_D(entry.title, ssd_)[:256],
+            url=url,
+            color_hex=(
+                MUSICBOT_EMBED_COLOR_PAUSED if paused else MUSICBOT_EMBED_COLOR_PLAYING
+            ),
+            delete_after=delete_after,
+        )
+        if paused:
+            card.set_author(name=f"{EMOJI_PAUSE} " + _D("Paused", ssd_))
+        else:
+            card.set_author(name=f"{EMOJI_NOTES} " + _D("Now playing", ssd_))
+
+        if streaming:
+            duration = f"{EMOJI_LIVE} " + _D("Live", ssd_)
+        elif entry.duration is None:
+            duration = "?"
+        else:
+            duration = format_song_duration(entry.duration_td)
+        card.add_field(name=_D("Duration", ssd_), value=duration, inline=True)
+
+        if entry.author:
+            # A mention in an embed shows the name and never pings. In text
+            # mode it would ping, so only with NowPlayingMentions.
+            requester = (
+                entry.author.mention
+                if self.config.embeds or self.config.now_playing_mentions
+                else entry.author.name
+            )
+        else:
+            requester = _D("Autoplaylist", ssd_)
+        card.add_field(name=_D("Requested by", ssd_), value=requester, inline=True)
+
+        upcoming = player.playlist.peek()
+        if upcoming:
+            up_next = _D(upcoming.title, ssd_)
+            if len(up_next) > 45:
+                up_next = up_next[:45] + "…"
+            more = len(player.playlist.entries) - 1
+            if more > 0:
+                up_next += " " + _D("(+%(count)s more)", ssd_) % {"count": more}
+        else:
+            up_next = _D("Nothing queued", ssd_)
+        card.add_field(name=_D("Up next", ssd_), value=up_next, inline=True)
+
+        if entry.thumbnail_url:
+            card.set_thumbnail(url=entry.thumbnail_url)
+        else:
+            log.warning("No thumbnail set for entry with URL: %s", entry.url)
+        return card
+
+    def _track_np_controls(
+        self,
+        guild: discord.Guild,
+        msg: Optional[discord.Message],
+        view: Optional[discord.ui.View],
+    ) -> None:
+        """Remember the card that carries the player buttons (polish)."""
+        if view is None:
+            return
+        if msg is None:  # the send failed
+            view.stop()
+            return
+        ssd = self.server_data[guild.id]
+        ssd.np_controls_msg = msg
+        ssd.np_controls_view = view
+
+    async def _retire_np_controls(self, guild: discord.Guild, edit: bool = True) -> None:
+        """
+        Take the buttons off the previous card, so only the newest card has
+        them. `edit=False` when that message is about to be deleted anyway.
+        """
+        ssd = self.server_data[guild.id]
+        msg, view = ssd.np_controls_msg, ssd.np_controls_view
+        ssd.np_controls_msg = None
+        ssd.np_controls_view = None
+        # Stop before editing: the store keys a message's buttons by custom_id,
+        # so stopping an old view later would also unregister its replacement.
+        if view is not None:
+            view.stop()
+        if msg is not None and edit:
+            try:
+                await msg.edit(view=None)
+            except discord.HTTPException:
+                log.debug("Could not remove the buttons from an old card.", exc_info=True)
+
+    async def refresh_np_controls(self, guild: discord.Guild) -> None:
+        """Redraw the newest card's buttons after pause, resume or repeat changes."""
+        ssd = self.server_data[guild.id]
+        msg = ssd.np_controls_msg
+        player = self.get_player_in(guild)
+        if msg is None or player is None:
+            return
+        if ssd.np_controls_view is not None:
+            ssd.np_controls_view.stop()
+            ssd.np_controls_view = None
+        view = PlayerControls(self, player)
+        try:
+            await msg.edit(view=view)
+        except discord.HTTPException:
+            log.debug("Could not update the buttons on the card.", exc_info=True)
+            view.stop()
+            return
+        ssd.np_controls_view = view
+
+    async def _button_refusal(self, interaction: discord.Interaction, text: str) -> None:
+        """Tell only the person who pressed a player button why nothing happened."""
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(text, ephemeral=True)
+            else:
+                await interaction.response.send_message(text, ephemeral=True)
+        except discord.HTTPException:
+            log.warning("Could not answer a player button press.", exc_info=True)
+
+    async def _button_announce(self, interaction: discord.Interaction, text: str) -> None:
+        """Post a player button's result in the channel, for everyone to see."""
+        try:
+            msg = await interaction.followup.send(
+                text, allowed_mentions=discord.AllowedMentions.none(), wait=True
+            )
+        except discord.HTTPException:
+            log.warning("Could not post a player button's result.", exc_info=True)
+            return
+        if self.config.delete_messages:
+            try:
+                await msg.delete(delay=self.config.delete_delay_short)
+            except discord.HTTPException:
+                pass
+
+    async def _button_queue(
+        self,
+        ssd: GuildSpecificData,
+        guild: discord.Guild,
+        channel: MessageableChannel,
+        player: MusicPlayer,
+    ) -> None:
+        """The queue button: `queue` waits for page reactions, so it runs as a task."""
+        try:
+            await self.cmd_queue(ssd, guild, channel, player)
+        except exceptions.MusicbotException as e:
+            log.warning("Queue button: %s", _L(e.message) % e.fmt_args)
+        except Exception:  # pylint: disable=broad-exception-caught
+            log.exception("Exception while showing the queue for a button press.")
+
+    async def handle_player_button(
+        self, interaction: discord.Interaction, button_id: str
+    ) -> None:
+        """
+        A press on a player button (polish). Runs the same checks as a typed
+        command (blocklist, permissions.ini), and the presser must also be in
+        the bot's voice channel (the owner is exempt). Results are posted in
+        the channel; refusals and errors go only to the presser.
+        """
+        guild = interaction.guild
+        member = interaction.user
+        if guild is None or not isinstance(member, discord.Member):
+            await self._button_refusal(
+                interaction, _D("These buttons only work in a server.", None)
+            )
+            return
+        ssd = self.server_data[guild.id]
+
+        # Only the newest card's buttons work. After a restart that's unknown
+        # until a new card is posted, so the old one keeps working until then.
+        current = ssd.np_controls_msg
+        card = interaction.message
+        if current is not None and card is not None and card.id != current.id:
+            await self._button_refusal(
+                interaction,
+                _D("This card is out of date. Use the newest now-playing message.", ssd),
+            )
+            try:
+                await card.edit(view=None)
+            except discord.HTTPException:
+                pass
+            return
+
+        is_owner = member.id == self.config.owner_id
+        if self.config.user_blocklist.is_blocked(member) and not is_owner:
+            log.warning(
+                "User in block list: %(id)s/%(name)s  pressed a player button.",
+                {"id": member.id, "name": member},
+            )
+            await self._button_refusal(interaction, _D("You can't use this bot.", ssd))
+            return
+
+        player = self.get_player_in(guild)
+        if player is None or not player.voice_client.is_connected():
+            await self._button_refusal(
+                interaction, _D("The bot isn't in a voice channel right now.", ssd)
+            )
+            return
+        bot_vc = player.voice_client.channel
+        if not is_owner and (member.voice is None or member.voice.channel != bot_vc):
+            await self._button_refusal(
+                interaction,
+                _D("Join %(channel)s to use the player buttons.", ssd)
+                % {"channel": bot_vc.mention},
+            )
+            return
+
+        commands = {
+            BUTTON_PAUSE_RESUME: "resume" if player.is_paused else "pause",
+            BUTTON_SKIP: "skip",
+            BUTTON_REPEAT: "repeat",
+            BUTTON_SHUFFLE: "shuffle",
+            BUTTON_QUEUE: "queue",
+        }
+        command = commands.get(button_id)
+        if command is None:
+            log.warning("Unknown player button: %s", button_id)
+            await self._button_refusal(interaction, _D("That button does nothing.", ssd))
+            return
+
+        perms = self.permissions.for_user(member)
+        if not is_owner and not perms.can_use_command(command):
+            await self._button_refusal(
+                interaction,
+                _D(
+                    "`%(command)s` is not allowed for your permissions group: %(group)s",
+                    ssd,
+                )
+                % {"command": command, "group": perms.name},
+            )
+            return
+
+        log.info(
+            "Button from %(id)s/%(name)s: %(command)s",
+            {"id": member.id, "name": member, "command": command},
+        )
+
+        if command == "queue":
+            if not player.playlist.entries:
+                await self._button_refusal(
+                    interaction, _D("There are no songs queued.", ssd)
+                )
+                return
+            await interaction.response.defer()
+            self.create_task(
+                self._button_queue(ssd, guild, interaction.channel, player),  # type: ignore[arg-type]
+                name="MB_QueueButton",
+            )
+            return
+
+        # Shuffle shows a short animation, longer than the 3 s Discord allows
+        # before an interaction must be answered.
+        await interaction.response.defer()
+        name = f"**{discord.utils.escape_markdown(member.display_name)}**"
+        entry = player.current_entry
+        try:
+            if command == "pause":
+                response = await self.cmd_pause(ssd, player)
+                announce = f"{EMOJI_PAUSE} " + _D("%(user)s paused the music.", ssd)
+            elif command == "resume":
+                response = await self.cmd_resume(ssd, player)
+                announce = f"{EMOJI_PLAY} " + _D("%(user)s resumed the music.", ssd)
+            elif command == "skip":
+                # The button forces a skip for those allowed to; for everyone
+                # else it's a vote, like typing `skip`.
+                can_force = perms.instaskip or (
+                    self.config.allow_author_skip
+                    and entry is not None
+                    and entry.author is not None
+                    and entry.author.id == member.id
+                )
+                response = await self.cmd_skip(
+                    ssd,
+                    guild,
+                    player,
+                    member,
+                    card,  # type: ignore[arg-type]
+                    perms,
+                    bot_vc,
+                    "f" if can_force else "",
+                )
+                announce = ""
+                if can_force and entry is not None:
+                    announce = f"{EMOJI_SKIP} " + _D("%(user)s skipped `%(title)s`.", ssd)
+            elif command == "repeat":
+                response = await self.cmd_repeat(ssd, player)
+                announce = ""
+            else:
+                response = await self.cmd_shuffle(ssd, interaction.channel, player)  # type: ignore[arg-type]
+                announce = f"{EMOJI_SHUFFLE} " + _D("%(user)s shuffled the queue.", ssd)
+                try:
+                    await self.serialize_queue(guild)
+                except OSError:
+                    log.warning("Could not save the queue after a shuffle.", exc_info=True)
+        except exceptions.MusicbotException as e:
+            await self._button_refusal(interaction, _D(e.message, ssd) % e.fmt_args)
+            return
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            log.exception("Exception while handling player button: %s", command)
+            await self._button_refusal(
+                interaction,
+                _D(
+                    "Something went wrong running `%(command)s` (%(error)s). "
+                    "Details are in the bot's log.",
+                    ssd,
+                )
+                % {"command": command, "error": type(e).__name__},
+            )
+            return
+
+        if command == "repeat":
+            await self.refresh_np_controls(guild)
+
+        if response is None:
+            return
+        if isinstance(response, ErrorResponse):
+            await self._button_refusal(interaction, response.content)
+            return
+        if announce:
+            title = _D(entry.title, ssd) if entry is not None else ""
+            text = announce % {"user": name, "title": title}
+        else:
+            # The command's own reply (a skip vote, the repeat mode), signed.
+            emoji = EMOJI_SKIP if command == "skip" else EMOJI_REPEAT
+            text = f"{emoji} {name}: {response.content}"
+        await self._button_announce(interaction, text)
+
     async def safe_send_message(
         self,
         dest: discord.abc.Messageable,
@@ -1932,13 +2331,7 @@ class MusicBot(discord.Client):
             ch_name = str(dest.name)
 
         if not self.config.remove_embed_footer:
-            footer_text = DEFAULT_FOOTER_TEXT
-            if self.config.footer_text:
-                footer_text = self.config.footer_text
-            content.set_footer(
-                text=footer_text,
-                icon_url=DEFAULT_BOT_ICON,
-            )
+            content.set_footer(**self._footer())
 
         if reply_to and reply_to.channel == dest:
             send_kws["reference"] = reply_to.to_reference(fail_if_not_exists=False)
@@ -1946,6 +2339,9 @@ class MusicBot(discord.Client):
 
         if content.files:
             send_kws["files"] = content.files
+
+        if content.view is not None:
+            send_kws["view"] = content.view
 
         try:
             if (self.config.embeds and not content.force_text) or content.force_embed:
@@ -4532,7 +4928,8 @@ class MusicBot(discord.Client):
             # If the result has usable entries, we assume it is a playlist
             # but with only one entry is may be a search result.
             listlen = 1
-            track_title = ""
+            added_entry: Optional[EntryTypes] = None
+            playlist_thumb = ""
             if info.has_entries and info.entry_count > 1:
                 await self._do_playlist_checks(player, author, info)
 
@@ -4571,11 +4968,7 @@ class MusicBot(discord.Client):
                         fmt_args={"max": permissions.max_song_length},
                     )
 
-                reply_text = _D(
-                    "Enqueued **%(number)s** songs to be played.\n"
-                    "Position in queue: %(position)s",
-                    ssd_,
-                )
+                playlist_thumb = entry_list[0].thumbnail_url
 
             # If it's an entry
             else:
@@ -4607,17 +5000,12 @@ class MusicBot(discord.Client):
                 entry, position = await player.playlist.add_entry_from_info(
                     info, channel=channel, author=author, head=head
                 )
-
-                reply_text = _D(
-                    "Enqueued `%(track)s` to be played.\n"
-                    "Position in queue: %(position)s",
-                    ssd_,
-                )
-                track_title = _D(entry.title, ssd_)
+                added_entry = entry
 
             log.debug("Added song(s) at position %s", position)
+            eta_text = ""
             if position == 1 and player.is_stopped:
-                pos_str = _D("Playing next!", ssd_)
+                pos_str = _D("Playing next", ssd_)
                 player.play()
 
             # shift the playing track to the end of queue and skip current playback.
@@ -4632,36 +5020,59 @@ class MusicBot(discord.Client):
                     self.server_data[guild.id].current_playing_url = ""
 
                 player.skip()
-                pos_str = _D("Playing next!", ssd_)
+                pos_str = _D("Playing next", ssd_)
 
             else:
+                pos_str = str(position)
                 try:
                     time_until = await player.playlist.estimate_time_until(
                         position, player
                     )
-                    pos_str = _D(
-                        "%(position)s - estimated time until playing: `%(eta)s`",
-                        ssd_,
-                    ) % {
-                        "position": position,
-                        "eta": format_song_duration(time_until),
-                    }
+                    eta_text = format_song_duration(time_until)
                 except exceptions.InvalidDataError:
-                    pos_str = _D(
-                        "%(position)s - cannot estimate time until playing.",
-                        ssd_,
-                    ) % {"position": position}
+                    eta_text = "?"
                     log.warning(
                         "Cannot estimate time until playing for position: %d", position
                     )
 
-        reply_text %= {
-            "number": listlen,
-            "track": track_title,
-            "position": pos_str,
-        }
-
-        return Response(reply_text)
+        # The "added to queue" card (polish). In text mode, no link or image:
+        # Discord would post a preview for each.
+        embeds = self.config.embeds
+        if added_entry is not None:
+            url = added_entry.url
+            card = Response(
+                str(added_entry.info.get("uploader") or added_entry.info.get("channel") or ""),
+                title=_D(added_entry.title, ssd_)[:256],
+                url=url if embeds and url.startswith(("http://", "https://")) else None,
+            )
+            card.set_author(name="➕ " + _D("Added to queue", ssd_))
+            if isinstance(added_entry, StreamPlaylistEntry):
+                duration = f"{EMOJI_LIVE} " + _D("Live", ssd_)
+            elif added_entry.duration is None:
+                duration = "?"
+            else:
+                duration = format_song_duration(added_entry.duration_td)
+            card.add_field(name=_D("Duration", ssd_), value=duration, inline=True)
+            thumb = added_entry.thumbnail_url
+        else:
+            url = info.webpage_url or song_url
+            card = Response(
+                str(info.get("uploader") or info.get("channel") or ""),
+                title=(_D(info.title, ssd_) if info.title else _D("Playlist", ssd_))[
+                    :256
+                ],
+                url=url if embeds and url.startswith(("http://", "https://")) else None,
+            )
+            card.set_author(
+                name="➕ " + _D("Added %(number)s songs", ssd_) % {"number": listlen}
+            )
+            thumb = playlist_thumb
+        card.add_field(name=_D("Position", ssd_), value=pos_str, inline=True)
+        if eta_text:
+            card.add_field(name=_D("Plays in", ssd_), value=eta_text, inline=True)
+        if embeds and thumb:
+            card.set_thumbnail(url=thumb)
+        return card
 
     @command_helper(
         usage=["{cmd} <URL>"],
@@ -5069,80 +5480,26 @@ class MusicBot(discord.Client):
         # TODO: this may still need more tweaks for better i18n support.
         # Something to address the fragmented nature of strings in embeds.
         if player.current_entry:
-            last_np_msg = self.server_data[guild.id].last_np_msg
+            ssd = self.server_data[guild.id]
+            last_np_msg = ssd.last_np_msg
             if last_np_msg:
+                if ssd.np_controls_msg is not None and (
+                    ssd.np_controls_msg.id == last_np_msg.id
+                ):
+                    await self._retire_np_controls(guild, edit=False)
                 await self.safe_delete_message(last_np_msg)
-                self.server_data[guild.id].last_np_msg = None
+                ssd.last_np_msg = None
 
-            song_progress = format_song_duration(player.progress)
-            song_total = (
-                format_song_duration(player.current_entry.duration_td)
-                if player.current_entry.duration is not None
-                else "(no duration data)"
+            # The same card as the now-playing message, with a progress bar
+            # and the player buttons (polish).
+            content = self._np_card(
+                player, player.current_entry, ssd_, with_progress=True
             )
-
-            streaming = isinstance(player.current_entry, StreamPlaylistEntry)
-            prog_str = (
-                "`[{progress}]`" if streaming else "`[{progress}/{total}]`"
-            ).format(progress=song_progress, total=song_total)
-            prog_bar_str = ""
-
-            # percentage shows how much of the current song has already been played
-            percentage = 0.0
-            if (
-                player.current_entry.duration
-                and player.current_entry.duration_td.total_seconds() > 0
-            ):
-                percentage = (
-                    player.progress / player.current_entry.duration_td.total_seconds()
-                )
-
-            # create the actual bar
-            progress_bar_length = 30
-            for i in range(progress_bar_length):
-                if percentage < 1 / progress_bar_length * i:
-                    prog_bar_str += "□"
-                else:
-                    prog_bar_str += "■"
-
-            entry = player.current_entry
-            entry_author = player.current_entry.author
-            added_by = _D("[autoplaylist]", ssd_)
-            if entry_author:
-                added_by = entry_author.name
-
-            content = Response("", title=_D("Now playing", ssd_))
-            content.add_field(
-                name=(
-                    _D("Currently streaming:", ssd_)
-                    if streaming
-                    else _D("Currently playing:", ssd_)
-                ),
-                value=_D(entry.title, ssd_),
-                inline=False,
-            )
-            content.add_field(
-                name=_D("Added By:", ssd_),
-                value=_D("`%(user)s`", ssd_) % {"user": added_by},
-                inline=False,
-            )
-            content.add_field(
-                name=_D("Progress:", ssd_),
-                value=f"{prog_str}\n{prog_bar_str}\n\n",
-                inline=False,
-            )
-            if len(entry.url) <= 1024:
-                # TRANSLATORS:  URL field title for embeds.
-                content.add_field(name=_D("URL:", ssd_), value=entry.url, inline=False)
-            if entry.thumbnail_url:
-                content.set_image(url=entry.thumbnail_url)
-            else:
-                log.warning("No thumbnail set for entry with URL: %s", entry.url)
-
-            self.server_data[guild.id].last_np_msg = await self.safe_send_message(
-                channel,
-                content,
-            )
+            content.view = PlayerControls(self, player)
+            await self._retire_np_controls(guild)
+            msg = await self.safe_send_message(channel, content)
+            ssd.last_np_msg = msg
+            self._track_np_controls(guild, msg, content.view)
             return None
 
         return Response(
@@ -6465,32 +6822,35 @@ class MusicBot(discord.Client):
                 fmt_args={"total": pages_total},
             )
 
-        # Get current entry info if any.
+        # A compact list (polish): the current song, one line per queued song,
+        # then the totals. Titles are links only in embed mode; in text mode
+        # Discord would post a preview for every link.
+        embeds = self.config.embeds
+
+        def song_line(item: EntryTypes, max_len: int) -> str:
+            title = _D(item.title, ssd_)
+            if len(title) > max_len:
+                title = title[:max_len] + "…"
+            url = item.url
+            if embeds and url.startswith(("http://", "https://")):
+                return f"[{link_text(title)}]({url})"
+            return discord.utils.escape_markdown(title)
+
+        def requester(item: EntryTypes) -> str:
+            if item.channel and item.author:
+                return discord.utils.escape_markdown(item.author.name)
+            return _D("autoplaylist", ssd_)
+
         current_progress = ""
         if player.is_playing and player.current_entry:
+            cur = player.current_entry
             song_progress = format_song_duration(player.progress)
-            song_total = (
-                format_song_duration(player.current_entry.duration_td)
-                if player.current_entry.duration is not None
-                else _D("(unknown duration)", ssd_)
+            if cur.duration is not None:
+                song_progress += " / " + format_song_duration(cur.duration_td)
+            current_progress = (
+                f"{EMOJI_PLAY} **{song_line(cur, 60)}**\n"
+                f"`{song_progress}` · {requester(cur)}\n\n"
             )
-            added_by = _D("[autoplaylist]", ssd_)
-            cur_entry_channel = player.current_entry.channel
-            cur_entry_author = player.current_entry.author
-            if cur_entry_channel and cur_entry_author:
-                added_by = cur_entry_author.name
-
-            current_progress = _D(
-                "Currently playing: `%(title)s`\n"
-                "Added by: `%(user)s`\n"
-                "Progress: `[%(progress)s/%(total)s]`\n",
-                ssd_,
-            ) % {
-                "title": _D(player.current_entry.title, ssd_),
-                "user": added_by,
-                "progress": song_progress,
-                "total": song_total,
-            }
 
         # calculate start and stop slice indices
         start_index = self.config.queue_length * page_number
@@ -6507,23 +6867,17 @@ class MusicBot(discord.Client):
                 log.debug("Skipped the current playlist entry.")
                 continue
 
-            added_by = _D("[autoplaylist]", ssd_)
-            if item.channel and item.author:
-                added_by = item.author.name
-
-            # shorten the titles to get more tracks in the list.
-            title = item.title
-            if len(item.title) > 40:
-                title = item.title[:40] + " ..."
-
-            next_track_list = _D(
-                "**Entry #%(index)s:**"
-                "Title: `%(title)s`\n"
-                "Added by: `%(user)s`\n\n",
-                ssd_,
-            ) % {"index": idx, "title": _D(title, ssd_), "user": added_by}
-            # We limit the track list, and leave extra space for the rest of the description text.
-            if (len(tracks_list) + len(next_track_list)) < 3840:
+            length = (
+                format_song_duration(item.duration_td)
+                if item.duration is not None
+                else "?"
+            )
+            next_track_list = (
+                f"`{idx}.` {song_line(item, 45)} · `{length}` · {requester(item)}\n"
+            )
+            # We limit the track list, and leave extra space for the rest of the
+            # description text (4096 max; the current song line has a link too).
+            if (len(tracks_list) + len(next_track_list)) < 3600:
                 tracks_per_page += 1
                 tracks_list += next_track_list
 
@@ -6537,22 +6891,22 @@ class MusicBot(discord.Client):
                 {"option": self.config.queue_length, "count": tracks_per_page},
             )
 
+        entries = player.playlist.entries
+        summary = _D("%(total)s songs", ssd_) % {"total": total_entry_count}
+        if all(e.duration is not None for e in entries):
+            total_time = sum(e.duration_td.total_seconds() for e in entries)
+            summary += " · " + _D("%(time)s total", ssd_) % {
+                "time": format_song_duration(total_time)
+            }
+        if pages_total > 1:
+            summary += " · " + _D("page %(page)s of %(pages)s", ssd_) % {
+                "page": page_number + 1,
+                "pages": pages_total,
+            }
+
         embed = Response(
-            _D(
-                "%(progress)s"
-                "There are `%(total)s` entries in the queue.\n"
-                "Here are the next %(per_page)s songs, starting at song #%(start)s\n"
-                "\n%(tracks)s",
-                ssd_,
-            )
-            % {
-                "progress": current_progress,
-                "total": total_entry_count,
-                "per_page": self.config.queue_length,
-                "start": starting_at,
-                "tracks": tracks_list,
-            },
-            title=_D("Songs in queue", ssd_),
+            f"{current_progress}{tracks_list}\n{summary}",
+            title=f"{EMOJI_QUEUE} " + _D("Queue", ssd_),
             delete_after=self.config.delete_delay_long,
         )
 
@@ -8546,6 +8900,10 @@ class MusicBot(discord.Client):
                     log.warning(
                         "Could not save the queue after `%s`.", command, exc_info=True
                     )
+
+            # The repeat button shows the mode; a typed `repeat` changes it too.
+            if command == "repeat" and message.guild:
+                await self.refresh_np_controls(message.guild)
 
             if response and isinstance(response, MusicBotResponse):
                 # Set a default response title if none is set.

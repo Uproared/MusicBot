@@ -94,6 +94,10 @@ class GuildSpecificData:
         self._last_np_msg: Optional[discord.Message] = None
 
         # Members below are available for public use.
+        # The now-playing card that carries the player buttons, and its view.
+        # Separate from last_np_msg, which `summon` also sets to its own message.
+        self.np_controls_msg: Optional[discord.Message] = None
+        self.np_controls_view: Optional[discord.ui.View] = None
         self.last_played_song_subject: str = ""
         self.follow_user: Optional[discord.Member] = None
         self.auto_join_channel: Optional[
@@ -396,6 +400,7 @@ class MusicBotResponse(discord.Embed):
         delete_after: Union[None, int, float] = None,
         force_text: bool = False,
         force_embed: bool = False,
+        view: Optional[discord.ui.View] = None,
         **kwargs: Any,
     ) -> None:
         """
@@ -414,8 +419,10 @@ class MusicBotResponse(discord.Embed):
                                 Only used if message delete options are enabled.
         :param: force_text:  Regardless of settings, this response should be text-only.
         :param: force_embed: Regardless of settings, this response should be embed-only.
+        :param: view:  Buttons to attach to the message (the player controls).
         """
         self.content = content
+        self.view = view
         self.codeblock = codeblock
         self.reply_to = reply_to
         self.send_to = send_to
@@ -453,9 +460,12 @@ class MusicBotResponse(discord.Embed):
         descr = ""
         image = ""
         fields = ""
+        # The cards put "Now playing" / "Added to queue" in the author line.
+        if self.author and self.author.name:
+            title = f"**{self.author.name}**\n"
         if self.title:
             # TRANSLATORS: text-only format for embed title.
-            title = _D("## %(title)s\n", ssd_) % {"title": self.title}
+            title += _D("## %(title)s\n", ssd_) % {"title": self.title}
         if self.description:
             # TRANSLATORS: text-only format for embed description.
             descr = _D("%(content)s\n", ssd_) % {"content": self.description}
