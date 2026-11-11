@@ -33,6 +33,9 @@ EMOJI_QUEUE = "\U0001f4dc"
 EMOJI_NOTES = "\U0001f3b6"
 EMOJI_LIVE = "\U0001f534"
 
+# Seconds between progress-bar updates on the newest now-playing card.
+NP_PROGRESS_INTERVAL = 15
+
 EMOJI_WARNING = "⚠️"
 EMOJI_HELP = "❓"
 

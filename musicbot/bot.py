@@ -98,6 +98,7 @@ from .player_ui import (
     EMOJI_REPEAT_ONE,
     EMOJI_SHUFFLE,
     EMOJI_SKIP,
+    NP_PROGRESS_INTERVAL,
     PlayerControls,
     command_header,
     command_icon,
@@ -379,6 +380,40 @@ class MusicBot(discord.Client):
         muffle_discord_console_log()
         self.create_task(self._test_network(), name="MB_PingTest")
         self.create_task(self._player_watchdog(), name="MB_PlayerWatchdog")
+        self.create_task(self._np_progress_loop(), name="MB_NowPlayingProgress")
+
+    async def _np_progress_loop(self) -> None:
+        """
+        Every NP_PROGRESS_INTERVAL (15 s), move the progress bar on the newest
+        now-playing card of each guild that's playing (polish). One small
+        message edit per playing guild; nothing while paused or stopped.
+        """
+        while not self.logout_called:
+            await asyncio.sleep(NP_PROGRESS_INTERVAL)
+            try:
+                await self._update_np_progress()
+            except Exception:  # pylint: disable=broad-exception-caught
+                log.exception("Now-playing progress update failed.")
+
+    async def _update_np_progress(self) -> None:
+        """One pass of the progress loop."""
+        for guild_id, player in list(self.players.items()):
+            ssd = self.server_data[guild_id]
+            msg, entry = ssd.np_controls_msg, ssd.np_controls_entry
+            if (
+                msg is None
+                or entry is None
+                or not player.is_playing
+                or player.current_entry is not entry
+            ):
+                continue
+            try:
+                await msg.edit(**self._np_card_edit(ssd, player, entry))
+            except discord.NotFound:
+                # Deleted by someone, or by DeleteNowPlaying: forget it.
+                await self._retire_np_controls(player.voice_client.guild, edit=False)
+            except discord.HTTPException:
+                log.debug("Could not update the now-playing card.", exc_info=True)
 
     async def _player_watchdog(self) -> None:
         """
@@ -1288,7 +1323,10 @@ class MusicBot(discord.Client):
         if skipping_absent:
             content = Response(newmsg, delete_after=auto_delete_np)
         else:
-            content = self._np_card(player, entry, ssd_, delete_after=auto_delete_np)
+            # With the progress bar: the progress loop keeps it moving.
+            content = self._np_card(
+                player, entry, ssd_, with_progress=True, delete_after=auto_delete_np
+            )
             content.view = PlayerControls(self, player)
 
         # send it in specified channel
@@ -1317,7 +1355,7 @@ class MusicBot(discord.Client):
         await self._retire_np_controls(guild)
         msg = await self.safe_send_message(np_channel, content)
         self.server_data[guild.id].last_np_msg = msg
-        self._track_np_controls(guild, msg, content.view)
+        self._track_np_controls(guild, msg, content.view, entry)
 
         # TODO: Check channel voice state?
 
@@ -1806,12 +1844,22 @@ class MusicBot(discord.Client):
 
                 # "Listening to <song>" (polish). It was a Streaming activity,
                 # which Discord showed wrongly (e.g. as a Twitch link). The
-                # uploader goes in `state`, one of the four fields bots may set.
-                info = getattr(player.current_entry, "info", None) or {}
+                # uploader and length go in `state`, one of the four fields
+                # bots may set ("Artist · 03:24"). No elapsed time: each change
+                # is a presence update, and those are rate limited.
+                cur = player.current_entry
+                info = getattr(cur, "info", None) or {}
+                bits = []
                 uploader = info.get("uploader") or info.get("channel")
+                if uploader:
+                    bits.append(str(uploader))
+                if isinstance(cur, StreamPlaylistEntry):
+                    bits.append(f"{EMOJI_LIVE} Live")
+                elif cur.duration:
+                    bits.append(format_song_duration(cur.duration_td))
                 extra = {}
-                if uploader and not self.config.status_message:
-                    extra["state"] = str(uploader)[:128]
+                if bits and not self.config.status_message:
+                    extra["state"] = " · ".join(bits)[:128]
                 activity = discord.Activity(
                     type=discord.ActivityType.listening,
                     name=text,
@@ -2044,13 +2092,29 @@ class MusicBot(discord.Client):
             log.warning("No thumbnail set for entry with URL: %s", entry.url)
         return card
 
+    def _np_card_edit(
+        self, ssd: GuildSpecificData, player: MusicPlayer, entry: EntryTypes
+    ) -> Dict[str, Any]:
+        """
+        Message.edit() arguments that redraw the button card for `entry`, with
+        the progress bar and paused state as they are now. An edit replaces the
+        whole embed, so the footer that safe_send_message added goes back on.
+        """
+        card = self._np_card(player, entry, ssd, with_progress=True)
+        if not self.config.embeds:
+            return {"content": card.to_markdown(ssd)}
+        if not self.config.remove_embed_footer:
+            card.set_footer(**self._footer())
+        return {"embed": card}
+
     def _track_np_controls(
         self,
         guild: discord.Guild,
         msg: Optional[discord.Message],
         view: Optional[discord.ui.View],
+        entry: Optional[EntryTypes] = None,
     ) -> None:
-        """Remember the card that carries the player buttons (polish)."""
+        """Remember the card that carries the player buttons, and its song (polish)."""
         if view is None:
             return
         if msg is None:  # the send failed
@@ -2059,6 +2123,7 @@ class MusicBot(discord.Client):
         ssd = self.server_data[guild.id]
         ssd.np_controls_msg = msg
         ssd.np_controls_view = view
+        ssd.np_controls_entry = entry
 
     async def _retire_np_controls(self, guild: discord.Guild, edit: bool = True) -> None:
         """
@@ -2069,6 +2134,7 @@ class MusicBot(discord.Client):
         msg, view = ssd.np_controls_msg, ssd.np_controls_view
         ssd.np_controls_msg = None
         ssd.np_controls_view = None
+        ssd.np_controls_entry = None
         # Stop before editing: the store keys a message's buttons by custom_id,
         # so stopping an old view later would also unregister its replacement.
         if view is not None:
@@ -2082,7 +2148,10 @@ class MusicBot(discord.Client):
                 log.debug("Could not remove the buttons from an old card.", exc_info=True)
 
     async def refresh_np_controls(self, guild: discord.Guild) -> None:
-        """Redraw the newest card's buttons after pause, resume or repeat changes."""
+        """
+        Redraw the newest card after pause, resume or repeat changes: its
+        buttons, and while its song plays, the card too (amber when paused).
+        """
         ssd = self.server_data[guild.id]
         msg = ssd.np_controls_msg
         player = self.get_player_in(guild)
@@ -2092,8 +2161,16 @@ class MusicBot(discord.Client):
             ssd.np_controls_view.stop()
             ssd.np_controls_view = None
         view = PlayerControls(self, player)
+        kwargs: Dict[str, Any] = {"view": view}
+        entry = ssd.np_controls_entry
+        if entry is not None and player.current_entry is entry:
+            kwargs.update(self._np_card_edit(ssd, player, entry))
         try:
-            await msg.edit(view=view)
+            await msg.edit(**kwargs)
+        except discord.NotFound:
+            view.stop()
+            await self._retire_np_controls(guild, edit=False)
+            return
         except discord.HTTPException:
             log.debug("Could not update the buttons on the card.", exc_info=True)
             view.stop()
@@ -5532,7 +5609,7 @@ class MusicBot(discord.Client):
             await self._retire_np_controls(guild)
             msg = await self.safe_send_message(channel, content)
             ssd.last_np_msg = msg
-            self._track_np_controls(guild, msg, content.view)
+            self._track_np_controls(guild, msg, content.view, player.current_entry)
             return None
 
         return Response(

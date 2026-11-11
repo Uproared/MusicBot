@@ -103,6 +103,9 @@ class GuildSpecificData:
         # The view on the button card. The card itself is np_controls_msg,
         # separate from last_np_msg, which `summon` also sets to its own message.
         self.np_controls_view: Optional[discord.ui.View] = None
+        # The song the button card was made for; its progress bar is only
+        # redrawn while that song plays.
+        self.np_controls_entry: Optional[Any] = None
         self.last_played_song_subject: str = ""
         self.follow_user: Optional[discord.Member] = None
         self.auto_join_channel: Optional[
