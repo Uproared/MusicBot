@@ -616,14 +616,21 @@ class MusicBot(discord.Client):
 
         for guild, channel in channel_map.items():
 
-            if (
-                isinstance(guild.voice_client, discord.VoiceClient)
-                and guild.voice_client.is_connected()
-            ):
-                log.info(
-                    "Already connected to channel:  %(channel)s  in guild:  %(guild)s",
-                    {"channel": guild.voice_client.channel.name, "guild": guild.name},
-                )
+            if isinstance(guild.voice_client, discord.VoiceClient):
+                if guild.voice_client.is_connected():
+                    log.info(
+                        "Already connected to channel:  %(channel)s  in guild:  %(guild)s",
+                        {"channel": guild.voice_client.channel.name, "guild": guild.name},
+                    )
+                else:
+                    # discord.py removes a voice client it has given up on, so this
+                    # one is still (re)connecting. Rebuilding the player here would
+                    # clear the live queue and fight that reconnect (B8); the player
+                    # resumes by itself once voice is back (B2).
+                    log.info(
+                        "Voice in guild %(guild)s is reconnecting, leaving it to discord.py.",
+                        {"guild": guild.name},
+                    )
                 continue
 
             if channel and isinstance(
@@ -788,22 +795,12 @@ class MusicBot(discord.Client):
                     log.warning("Disconnect failed or was cancelled?")
 
         # Otherwise we need to connect to the given channel.
-        max_timeout = VOICE_CLIENT_RECONNECT_TIMEOUT * VOICE_CLIENT_MAX_RETRY_CONNECT
+        # A fixed timeout: discord.py reuses it for reconnects and for how long
+        # playback waits on a dropped connection (B2).
         for attempt in range(1, (VOICE_CLIENT_MAX_RETRY_CONNECT + 1)):
-            timeout = attempt * VOICE_CLIENT_RECONNECT_TIMEOUT
-            if timeout > max_timeout:
-                log.critical(
-                    "MusicBot is unable to connect to the channel right now:  %(channel)s",
-                    {"channel": channel},
-                )
-                raise exceptions.CommandError(
-                    "MusicBot could not connect to the channel.\n"
-                    "Try again later, or restart the bot if this continues."
-                )
-
             try:
                 client: discord.VoiceClient = await channel.connect(
-                    timeout=timeout,
+                    timeout=VOICE_CLIENT_RECONNECT_TIMEOUT,
                     reconnect=True,
                     self_deaf=self.config.self_deafen,
                 )
@@ -823,6 +820,24 @@ class MusicBot(discord.Client):
                 raise exceptions.CommandError(
                     "MusicBot connection to voice was cancelled. This is odd. Maybe restart?"
                 ) from e
+            except discord.ClientException as e:
+                # e.g. "Already connected to a voice channel." No point retrying.
+                log.error("Could not connect to voice:  %s", e)
+                raise exceptions.CommandError(
+                    "MusicBot could not connect to the channel:  %(reason)s",
+                    fmt_args={"reason": str(e)},
+                ) from e
+        else:
+            # Every attempt timed out (B4: this used to fall through to an
+            # unassigned `client` and raise UnboundLocalError).
+            log.critical(
+                "MusicBot is unable to connect to the channel right now:  %(channel)s",
+                {"channel": channel},
+            )
+            raise exceptions.CommandError(
+                "MusicBot could not connect to the channel.\n"
+                "Try again later, or restart the bot if this continues."
+            )
 
         # request speaker automatically in stage channels.
         if isinstance(channel, discord.StageChannel):
@@ -8909,11 +8924,12 @@ class MusicBot(discord.Client):
             o_guild.voice_client, discord.VoiceClient
         ):
             o_vc = o_guild.voice_client
-            # borrow this for logging sake.
-            close_code = (
-                o_vc._connection.ws._close_code  # pylint: disable=protected-access
-            )
-            state = o_vc._connection.state  # pylint: disable=protected-access
+            # borrow this for logging sake. These are private discord.py fields,
+            # and `ws` is a MISSING placeholder until voice first connects, so
+            # don't let reading them break the cleanup below (C2).
+            conn = getattr(o_vc, "_connection", None)
+            close_code = getattr(getattr(conn, "ws", None), "_close_code", None)
+            state = getattr(conn, "state", None)
 
         # These conditions are met when API terminates a voice client.
         # This could be a user initiated disconnect, but we have no way to tell.

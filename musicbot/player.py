@@ -292,6 +292,9 @@ class MusicPlayer(EventEmitter, Serializable):
         self._play_lock = asyncio.Lock()
         self._current_player: Optional[VoiceClient] = None
         self._current_entry: Optional[EntryTypes] = None
+        # Set when MusicPlayer itself stops playback (skip, stop, new track), so
+        # the end of a track can be told apart from a dropped voice connection.
+        self._stop_requested: bool = False
 
         self._source: Optional[SourcePlaybackCounter] = None
 
@@ -458,6 +461,15 @@ class MusicPlayer(EventEmitter, Serializable):
             log.debug("Playback finished, but _current_entry is None.")
             return
 
+        stop_requested = self._stop_requested
+        self._stop_requested = False
+
+        # B2: when voice stays down longer than VoiceClient.timeout, discord.py
+        # ends playback with no error, which looked like the track finishing.
+        if not error and not stop_requested and self._voice_dropped_mid_track(entry):
+            self._requeue_after_voice_drop(entry)
+            return
+
         # Re-queue for repeat/loop, except when:
         # - playback failed, so a broken track can't loop forever;
         # - seek, speed or volume already put this entry back at the head
@@ -494,12 +506,59 @@ class MusicPlayer(EventEmitter, Serializable):
         # finally, tell the rest of MusicBot that playback is done.
         self.emit("finished-playing", player=self, entry=entry)
 
+    def _voice_dropped_mid_track(self, entry: EntryTypes) -> bool:
+        """True if voice is down and the entry hadn't (nearly) finished."""
+        if self.voice_client.is_connected():
+            return False
+        duration = entry.duration
+        return not duration or self.progress < duration - 2
+
+    def _requeue_after_voice_drop(self, entry: EntryTypes) -> None:
+        """
+        Put the entry back at the head of the queue at its current position,
+        keep its media file, and resume once voice is back.
+        """
+        progress = self.progress
+        if isinstance(entry, (URLPlaylistEntry, LocalFilePlaylistEntry)):
+            entry.set_start_time(progress)
+        self.playlist.entries.appendleft(entry)
+        log.warning(
+            "Voice connection lost during %(title)s at %(progress)d s, "
+            "will resume from there once voice reconnects.",
+            {"title": entry.title, "progress": progress},
+        )
+        self._current_player = None
+        self._current_entry = None
+        self._source = None
+        self.stop()
+        self.bot.create_task(
+            self._resume_after_voice_drop(), name="MB_ResumeAfterVoiceDrop"
+        )
+
+    async def _resume_after_voice_drop(self) -> None:
+        """
+        Wait for discord.py to reconnect voice, then continue the queue.
+        Gives up after 5 minutes; `resume` or `summon` restarts it by hand.
+        """
+        for _ in range(150):
+            await asyncio.sleep(2)
+            if self.is_dead or not self.is_stopped or not self.playlist.entries:
+                return  # disconnected for good, or something else took over
+            if self.voice_client.is_connected():
+                log.info("Voice reconnected, resuming playback.")
+                self.play()
+                return
+        log.warning(
+            "Voice did not reconnect within 5 minutes. Use resume or summon to continue."
+        )
+
     def _kill_current_player(self) -> bool:
         """
         If there is a current player source, attempt to stop it, then
         say "Garbage day!" and set it to None anyway.
         """
         if self._current_player:
+            self._stop_requested = True
             try:
                 self._current_player.stop()
             except OSError:
@@ -657,6 +716,7 @@ class MusicPlayer(EventEmitter, Serializable):
                         "Playing %(source)r using %(client)r",
                         {"source": self._source, "client": self.voice_client},
                     )
+                    self._stop_requested = False
                     self.voice_client.play(
                         counter,
                         after=functools.partial(self._playback_finished, source=counter),

@@ -115,11 +115,13 @@ DEFAULT_PING_SLEEP: float = 2
 FALLBACK_PING_TIMEOUT: int = 15
 FALLBACK_PING_SLEEP: float = 4
 
-# Minimum number of seconds to wait for a VoiceClient to connect.
-VOICE_CLIENT_RECONNECT_TIMEOUT: int = 5
-# Maximum number of retry attempts to make for VoiceClient connection.
-# Each retry increases the timeout by multiplying attempts by the above timeout.
-VOICE_CLIENT_MAX_RETRY_CONNECT: int = 5
+# Seconds to wait for a VoiceClient to connect, per attempt. discord.py keeps
+# this as VoiceClient.timeout and reuses it for voice reconnects and for how
+# long playback waits for a dropped connection, so it must not be short (B2).
+# discord.py's own default is 30. It retries the handshake within this time.
+VOICE_CLIENT_RECONNECT_TIMEOUT: int = 30
+# Maximum number of connection attempts for a VoiceClient.
+VOICE_CLIENT_MAX_RETRY_CONNECT: int = 2
 
 # Maximum number of seconds to wait for HEAD request on media files.
 DEFAULT_MAX_INFO_REQUEST_TIMEOUT: int = 10
