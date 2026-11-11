@@ -704,18 +704,19 @@ class MusicPlayer(EventEmitter, Serializable):
                         log.debug("File deleted:  %s", filename)
                         break
                     except PermissionError as e:
-                        if e.errno == 32:  # File is in use
-                            log.warning("Cannot delete file, it is currently in use.")
+                        # File in use (Windows only; it reports winerror 32 with
+                        # errno 13). ffmpeg may not have exited yet, so wait a bit.
+                        if 32 in (e.errno, getattr(e, "winerror", None)):
+                            log.debug("File is still in use, retrying:  %s", filename)
+                            await asyncio.sleep(1)
                         else:
                             log.warning(
                                 "Cannot delete file due to a permission error.",
                                 exc_info=True,
                             )
                     except FileNotFoundError:
-                        log.warning(
-                            "Cannot delete file, it was not found.",
-                            exc_info=True,
-                        )
+                        # Expected when playback failed because the file was missing.
+                        log.debug("File was already gone:  %s", filename)
                         break
                     except (OSError, IsADirectoryError):
                         log.warning(
@@ -724,7 +725,7 @@ class MusicPlayer(EventEmitter, Serializable):
                         )
                         break
                 else:
-                    log.debug("Could not delete file, giving up and moving on")
+                    log.warning("Could not delete file, giving up:  %s", filename)
 
     def __json__(self) -> Dict[str, Any]:
         return self._enclose_json(
