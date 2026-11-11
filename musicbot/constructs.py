@@ -13,6 +13,7 @@ from typing import (
     List,
     Optional,
     Set,
+    Tuple,
     Type,
     Union,
 )
@@ -93,10 +94,14 @@ class GuildSpecificData:
         self._last_np_ch_id: int = 0
         self._last_np_msg: Optional[discord.Message] = None
 
+        # The card with the player buttons, as (channel id, message id). Saved,
+        # so the card can be deleted after a restart or crash (polish).
+        self._np_card_ids: Tuple[int, int] = (0, 0)
+        self._np_controls_msg: Optional[discord.Message] = None
+
         # Members below are available for public use.
-        # The now-playing card that carries the player buttons, and its view.
-        # Separate from last_np_msg, which `summon` also sets to its own message.
-        self.np_controls_msg: Optional[discord.Message] = None
+        # The view on the button card. The card itself is np_controls_msg,
+        # separate from last_np_msg, which `summon` also sets to its own message.
         self.np_controls_view: Optional[discord.ui.View] = None
         self.last_played_song_subject: str = ""
         self.follow_user: Optional[discord.Member] = None
@@ -165,6 +170,47 @@ class GuildSpecificData:
         self._bot.create_task(
             self.save_guild_options_file(), name="MB_SaveGuildOptions"
         )
+
+    @property
+    def np_controls_msg(self) -> Optional[discord.Message]:
+        """The now-playing card that carries the player buttons, if any."""
+        return self._np_controls_msg
+
+    @np_controls_msg.setter
+    def np_controls_msg(self, value: Optional[discord.Message]) -> None:
+        """Set the button card, and save its IDs for cleanup after a restart."""
+        self._np_controls_msg = value
+        ids = (value.channel.id, value.id) if value is not None else (0, 0)
+        if ids != self._np_card_ids:
+            self._np_card_ids = ids
+            # Saving before the file is loaded would overwrite it with defaults.
+            if self._is_file_loaded:
+                self._bot.create_task(
+                    self.save_guild_options_file(), name="MB_SaveGuildOptions"
+                )
+
+    async def _delete_stale_np_card(self, ids: Tuple[int, int]) -> None:
+        """
+        Delete the button card left from before a restart or crash, so only
+        one card ever has buttons (polish). A newer card is never touched.
+        """
+        await self._bot.wait_until_ready()
+        ch_id, msg_id = ids
+        channel = self._bot.get_channel(ch_id)
+        if channel is not None and hasattr(channel, "get_partial_message"):
+            try:
+                await channel.get_partial_message(msg_id).delete()
+                log.debug("Deleted the now-playing card from before the restart.")
+            except discord.NotFound:
+                pass
+            except discord.HTTPException:
+                log.warning(
+                    "Could not delete the now-playing card from before the restart.",
+                    exc_info=True,
+                )
+        if self._np_card_ids == ids:  # no newer card meanwhile
+            self._np_card_ids = (0, 0)
+            await self.save_guild_options_file()
 
     @property
     def last_np_channel(self) -> Optional[discord.abc.Messageable]:
@@ -290,6 +336,20 @@ class GuildSpecificData:
 
             self._last_np_ch_id = int(options.get("last_np_ch_id", 0))
 
+            # A button card from before a restart or crash: delete it.
+            # (.data: older files have no such key, and Json.get warns.)
+            card = options.data.get("np_card")
+            if isinstance(card, list) and len(card) == 2 and self._np_controls_msg is None:
+                try:
+                    ids = (int(card[0]), int(card[1]))
+                except (TypeError, ValueError):
+                    ids = (0, 0)
+                if ids[0] and ids[1]:
+                    self._np_card_ids = ids
+                    self._bot.create_task(
+                        self._delete_stale_np_card(ids), name="MB_DeleteStaleCard"
+                    )
+
             guild_prefix = options.get("command_prefix", None)
             if guild_prefix:
                 self._command_prefix = guild_prefix
@@ -332,6 +392,7 @@ class GuildSpecificData:
             "auto_playlist": auto_playlist,
             "language": self.lang_code,
             "last_np_ch_id": self._last_np_ch_id,
+            "np_card": list(self._np_card_ids),
         }
 
         async with self._file_lock:
