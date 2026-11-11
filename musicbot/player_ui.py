@@ -1,12 +1,13 @@
 """
-How MusicBot's player looks in Discord (the polish batch): the progress bar,
-the short version shown in the embed footer, and the player buttons.
+How MusicBot looks in Discord (the polish batch): the progress bar, the short
+version shown in the embed footer, the player buttons, the header line on
+command replies and the help categories.
 
 The cards themselves are built in bot.py, next to the code that sends them.
 """
 
 import re
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple
 
 import discord
 
@@ -31,6 +32,104 @@ EMOJI_SHUFFLE = "\U0001f500"
 EMOJI_QUEUE = "\U0001f4dc"
 EMOJI_NOTES = "\U0001f3b6"
 EMOJI_LIVE = "\U0001f534"
+
+EMOJI_WARNING = "⚠️"
+EMOJI_HELP = "❓"
+
+# The help list's groups, in order. Commands not listed here go in "Other".
+HELP_CATEGORIES: List[Tuple[str, Tuple[str, ...]]] = [
+    ("\U0001f3b5 Play", ("play", "playnext", "playnow", "shuffleplay", "search", "stream")),
+    (
+        "⏯️ Player",
+        ("np", "pause", "resume", "skip", "seek", "speed", "volume", "repeat"),
+    ),
+    ("\U0001f4dc Queue", ("queue", "shuffle", "move", "remove", "clear", "karaoke")),
+    ("\U0001f50a Voice", ("summon", "disconnect", "follow")),
+    ("\U0001f3b6 Autoplaylist", ("autoplaylist", "resetplaylist")),
+    (
+        "ℹ️ Info",
+        (
+            "help", "id", "perms", "listids", "latency", "botlatency", "uptime",
+            "botversion", "checkupdates", "pldump",
+        ),
+    ),
+    (
+        "⚙️ Settings",
+        (
+            "config", "option", "setperms", "setprefix", "language", "setalias",
+            "setcookies", "cache", "clean",
+        ),
+    ),
+    (
+        "\U0001f6e0️ Bot admin",
+        (
+            "restart", "shutdown", "setname", "setnick", "setavatar", "joinserver",
+            "leaveserver", "blockuser", "blocksong",
+        ),
+    ),
+]
+HELP_OTHER = "\U0001f4e6 Other"
+
+# Icons for the header line on command replies. Commands without one use
+# their help group's icon.
+COMMAND_ICONS: Dict[str, str] = {
+    "play": "\U0001f3b5",
+    "playnext": "\U0001f3b5",
+    "playnow": "\U0001f3b5",
+    "shuffleplay": "\U0001f500",
+    "search": "\U0001f50e",
+    "stream": "\U0001f4e1",
+    "np": EMOJI_NOTES,
+    "pause": EMOJI_PAUSE,
+    "resume": EMOJI_PLAY,
+    "skip": EMOJI_SKIP,
+    "seek": "⏩",
+    "speed": "⏩",
+    "volume": "\U0001f50a",
+    "repeat": EMOJI_REPEAT,
+    "queue": EMOJI_QUEUE,
+    "shuffle": EMOJI_SHUFFLE,
+    "move": "↕️",
+    "remove": "➖",
+    "clear": "\U0001f9f9",
+    "karaoke": "\U0001f3a4",
+    "summon": "\U0001f4e5",
+    "disconnect": "\U0001f4e4",
+    "follow": "\U0001f463",
+    "help": EMOJI_HELP,
+    "restart": "\U0001f504",
+    "shutdown": "\U0001f6d1",
+}
+
+
+def command_icon(name: str) -> str:
+    """The icon for a command's reply header."""
+    if name in COMMAND_ICONS:
+        return COMMAND_ICONS[name]
+    for label, names in HELP_CATEGORIES:
+        if name in names:
+            return label.split(" ", 1)[0]
+    return "•"
+
+
+def command_header(name: str, error: bool = False) -> str:
+    """The header line on a command reply, e.g. '⏭️ skip', or '⚠️ skip' on errors."""
+    return f"{EMOJI_WARNING if error else command_icon(name)} {name}"
+
+
+def group_commands(names: Iterable[str]) -> List[Tuple[str, List[str]]]:
+    """Sort command names into the help groups, in order, leaving out empty ones."""
+    remaining = set(names)
+    groups = []
+    for label, members in HELP_CATEGORIES:
+        found = [n for n in members if n in remaining]
+        remaining.difference_update(found)
+        if found:
+            groups.append((label, found))
+    if remaining:
+        groups.append((HELP_OTHER, sorted(remaining)))
+    return groups
+
 
 # "<describe>-g<commit>-<branch>[-modded]", or "<commit>-<branch>..." when the
 # repo has no tags (see constants.VERSION).

@@ -16,7 +16,17 @@ import time
 import uuid
 from collections import defaultdict
 from io import BytesIO
-from typing import TYPE_CHECKING, Any, DefaultDict, Dict, List, Optional, Set, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    DefaultDict,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 import aiohttp
 import certifi
@@ -78,6 +88,7 @@ from .player_ui import (
     BUTTON_REPEAT,
     BUTTON_SHUFFLE,
     BUTTON_SKIP,
+    EMOJI_HELP,
     EMOJI_LIVE,
     EMOJI_NOTES,
     EMOJI_PAUSE,
@@ -88,6 +99,9 @@ from .player_ui import (
     EMOJI_SHUFFLE,
     EMOJI_SKIP,
     PlayerControls,
+    command_header,
+    command_icon,
+    group_commands,
     link_text,
     progress_bar,
     short_version,
@@ -1791,10 +1805,17 @@ class MusicBot(discord.Client):
                     text = format_status_msg(player)
 
                 # "Listening to <song>" (polish). It was a Streaming activity,
-                # which Discord showed wrongly (e.g. as a Twitch link).
+                # which Discord showed wrongly (e.g. as a Twitch link). The
+                # uploader goes in `state`, one of the four fields bots may set.
+                info = getattr(player.current_entry, "info", None) or {}
+                uploader = info.get("uploader") or info.get("channel")
+                extra = {}
+                if uploader and not self.config.status_message:
+                    extra["state"] = str(uploader)[:128]
                 activity = discord.Activity(
                     type=discord.ActivityType.listening,
                     name=text,
+                    **extra,
                 )
 
         # only 1 server is paused.
@@ -3509,14 +3530,20 @@ class MusicBot(discord.Client):
                             "command": alias_of,
                         }
 
+                    # One command (polish): the description first, then usage.
+                    parts = self._help_parts(a_command, guild)
+                    usage, desc, prefix_note = parts[:3] if parts else ("", "", "")
+                    body = desc.rstrip("\n")
+                    if usage:
+                        body += (
+                            "\n\n" + _D("**Usage**", ssd_) + f"\n```\n{usage}\n```"
+                        )
+                    for extra in (prefix_note, alias_usage, _get_aliases(a_command)):
+                        if extra:
+                            body += "\n" + extra.rstrip("\n")
                     return Response(
-                        # TRANSLATORS: template string for command-specific help output.
-                        _D("%(is_alias)s\n%(docs)s\n%(alias_list)s", ssd_)
-                        % {
-                            "is_alias": alias_usage,
-                            "docs": await self.gen_cmd_help(a_command, guild),
-                            "alias_list": _get_aliases(a_command),
-                        },
+                        body,
+                        title=f"{command_icon(a_command)} {a_command}",
                         delete_after=self.config.delete_delay_long,
                     )
 
@@ -3536,29 +3563,27 @@ class MusicBot(discord.Client):
         else:
             prefix = f"`{prefix}`"
 
-        all_note = ""
+        # The list (polish): one field per group of commands.
+        desc = _D(
+            "Prefix: %(prefix)s · details on one command: %(example_command)s",
+            ssd_,
+        ) % {"prefix": prefix, "example_command": example_help_cmd}
         if not is_all:
-            all_note = _D(
-                "The list above shows only commands permitted for your use.\n"
-                "For a list of all commands, run: %(example_all)s\n",
+            desc += "\n" + _D(
+                "Only the commands you may use are listed. All of them: %(example_all)s",
                 ssd_,
             ) % {"example_all": example_help_all}
 
-        desc = _D(
-            "**Commands by name:** *(without prefix)*\n"
-            "```\n%(command_list)s\n```\n"
-            "**Command Prefix:** %(prefix)s\n\n"
-            "For help with a particular command, run: %(example_command)s\n"
-            "%(all_note)s",
-            ssd_,
-        ) % {
-            "command_list": ", ".join(commands),
-            "prefix": prefix,
-            "example_command": example_help_cmd,
-            "all_note": all_note,
-        }
-
-        return Response(desc, delete_after=self.config.delete_delay_long)
+        card = Response(
+            desc,
+            title=f"{EMOJI_HELP} " + _D("Commands", ssd_),
+            delete_after=self.config.delete_delay_long,
+        )
+        for label, names in group_commands(commands):
+            card.add_field(
+                name=label, value=" ".join(f"`{n}`" for n in names), inline=False
+            )
+        return card
 
     @command_helper(
         # fmt: off
@@ -8914,11 +8939,14 @@ class MusicBot(discord.Client):
                 await self.refresh_np_controls(message.guild)
 
             if response and isinstance(response, MusicBotResponse):
-                # Set a default response title if none is set.
-                if not response.title:
-                    response.title = _D("**Command:** %(name)s", ssd) % {
-                        "name": command
-                    }
+                # A header line like the cards' (polish): "⏭️ skip", or
+                # "⚠️ skip" for an error reply. Was a "**Command:** skip" title.
+                if not response.title and not response.author.name:
+                    response.set_author(
+                        name=command_header(
+                            command, error=isinstance(response, ErrorResponse)
+                        )
+                    )
 
                 # Determine if the response goes to a calling channel or a DM.
                 send_kwargs: Dict[str, Any] = {}
@@ -8947,12 +8975,16 @@ class MusicBot(discord.Client):
                 },
                 exc_info=True,
             )
+            # Red, with the "⚠️ command" header (polish). The message renders
+            # normally in an embed (was a text code block, which showed its
+            # **bold** literally). Text mode keeps the code block: error text
+            # can hold user input, and a mention in a plain message pings.
             er = ErrorResponse(
                 _D(e.message, ssd) % e.fmt_args,
-                codeblock="text",
-                title="Error",
+                codeblock=None if self.config.embeds else "text",
                 reply_to=message,
             )
+            er.set_author(name=command_header(command, error=True))
             await self.safe_send_message(message.channel, er)
 
         # raise custom signals for shutdown and restart.
@@ -8975,9 +9007,9 @@ class MusicBot(discord.Client):
                     ssd,
                 )
                 % {"command": command, "error": type(e).__name__},
-                title=_D("Exception Error", ssd),
                 reply_to=message,
             )
+            er.set_author(name=command_header(command, error=True))
             await self.safe_send_message(message.channel, er)
 
         finally:
@@ -8996,10 +9028,45 @@ class MusicBot(discord.Client):
         :param: guild:  Guild where the call comes from.
         :param: for_md:  If true, output as "markdown" for Github Pages.
         """
+        parts = self._help_parts(cmd_name, guild)
+        if parts is None:
+            return ""
+        usage, desc, prefix_note, prefix_l = parts
+        ssd = self.server_data[guild.id] if guild else None
+
+        if for_md:
+            usage = usage.replace(prefix_l, "")
+            # usage = usage.replace("\n", "<br>\n")
+            desc = desc.replace("\n", "<br>\n")
+            return (
+                "<strong>Example usage:</strong><br>  \n"
+                "{%% highlight text %%}\n"
+                "%(usage)s\n"
+                "{%% endhighlight %%}\n"
+                "<strong>Description:</strong><br>  \n"
+                "%(desc)s"
+            ) % {"usage": usage, "desc": desc}
+
+        return _D(
+            "**Example usage:**\n"
+            "```%(usage)s```\n"
+            "%(prefix_note)s"
+            "**Description:**\n"
+            "%(desc)s",
+            ssd,
+        ) % {"usage": usage, "prefix_note": prefix_note, "desc": desc}
+
+    def _help_parts(
+        self, cmd_name: str, guild: Optional[discord.Guild]
+    ) -> Optional[Tuple[str, str, str, str]]:
+        """
+        A command's help pieces: (usage, description, prefix note, prefix).
+        None if there's no such command. Shared by `help` and gen_cmd_help.
+        """
         cmd = getattr(self, f"cmd_{cmd_name}", None)
         if not cmd:
             log.debug("Cannot generate help for missing command:  %s", cmd_name)
-            return ""
+            return None
 
         if not hasattr(cmd, "help_usage") or not hasattr(cmd, "help_desc"):
             log.critical("Missing help data for command:  %s", cmd_name)
@@ -9046,27 +9113,7 @@ class MusicBot(discord.Client):
             else:
                 usage = usage.replace("{prefix}", prefix_l)
 
-        if for_md:
-            usage = usage.replace(prefix_l, "")
-            # usage = usage.replace("\n", "<br>\n")
-            desc = desc.replace("\n", "<br>\n")
-            return (
-                "<strong>Example usage:</strong><br>  \n"
-                "{%% highlight text %%}\n"
-                "%(usage)s\n"
-                "{%% endhighlight %%}\n"
-                "<strong>Description:</strong><br>  \n"
-                "%(desc)s"
-            ) % {"usage": usage, "desc": desc}
-
-        return _D(
-            "**Example usage:**\n"
-            "```%(usage)s```\n"
-            "%(prefix_note)s"
-            "**Description:**\n"
-            "%(desc)s",
-            ssd,
-        ) % {"usage": usage, "prefix_note": prefix_note, "desc": desc}
+        return usage, desc, prefix_note, prefix_l
 
     async def gen_cmd_list(
         self, message: discord.Message, list_all_cmds: bool = False
