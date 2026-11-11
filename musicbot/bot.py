@@ -8400,7 +8400,8 @@ class MusicBot(discord.Client):
                 await self._check_ignore_non_voice(message)
 
             # Test for command permissions.
-            sub_cmd = args[0] if len(args) else ""
+            # Lowercase like the command name, so `restart UPPIP` can't dodge `restart_uppip`.
+            sub_cmd = args[0].lower() if args else ""
             if (
                 message.author.id != self.config.owner_id
                 and not user_permissions.can_use_command(command, sub_cmd)
