@@ -813,3 +813,122 @@ def test_status_shows_the_uploader_under_the_song(bot_cls, monkeypatch):
     fake, calls = _status_bot({1: _player(_entry("Song A"))}, status_message="{p0_title}!")
     _run_status(bot_cls, fake, monkeypatch)
     assert calls[0][1].state is None  # a custom StatusMessage stands alone
+
+
+# --- the button card is deleted after a restart or crash ------------------------
+
+
+def _guild_data(tmp_path, tasks, channel=None):
+    from musicbot.constructs import GuildSpecificData
+
+    (tmp_path / "1").mkdir(exist_ok=True)
+    bot = SimpleNamespace(
+        server_data={},
+        config=SimpleNamespace(
+            data_path=tmp_path, enable_options_per_guild=False, command_prefix="!"
+        ),
+        playlist_mgr=SimpleNamespace(
+            get_default=lambda: SimpleNamespace(load=_noop, filename="default.txt")
+        ),
+        create_task=lambda coro, name=None: tasks.append((name, coro)),
+        guilds=[SimpleNamespace(id=1, name="g")],
+        wait_until_ready=_noop,
+        get_channel=lambda cid: channel if channel is not None and cid == channel.id else None,
+    )
+    ssd = GuildSpecificData(bot)
+    bot.server_data[1] = ssd
+    return ssd
+
+
+def _run_tasks(tasks, name):
+    """Run the queued coroutines called `name` and close the rest. Tasks they
+    queue meanwhile stay in `tasks`."""
+    current = tasks[:]
+    del tasks[:]
+
+    async def run():
+        for task_name, coro in current:
+            if task_name == name:
+                await coro
+            else:
+                coro.close()
+    asyncio.run(run())
+
+
+def _saved(tmp_path):
+    import json
+
+    return json.loads((tmp_path / "1" / "options.json").read_text(encoding="utf8"))
+
+
+def _card_msg(msg_id, ch_id=3):
+    return SimpleNamespace(id=msg_id, channel=SimpleNamespace(id=ch_id))
+
+
+def test_button_card_ids_are_saved(tmp_path):
+    tasks = []
+    ssd = _guild_data(tmp_path, tasks)
+    _run_tasks(tasks, "MB_LoadGuildOptions")  # no file yet: loaded, empty
+
+    ssd.np_controls_msg = _card_msg(50)
+    _run_tasks(tasks, "MB_SaveGuildOptions")
+    assert _saved(tmp_path)["np_card"] == [3, 50]
+
+    ssd.np_controls_msg = None
+    _run_tasks(tasks, "MB_SaveGuildOptions")
+    assert _saved(tmp_path)["np_card"] == [0, 0]
+
+
+def _stale_setup(tmp_path, deleted):
+    import json
+
+    (tmp_path / "1").mkdir(exist_ok=True)
+    (tmp_path / "1" / "options.json").write_text(
+        json.dumps({"command_prefix": "?", "np_card": [3, 50]}), encoding="utf8"
+    )
+
+    async def delete():
+        deleted.append(50)
+
+    channel = SimpleNamespace(
+        id=3, get_partial_message=lambda mid: SimpleNamespace(delete=delete)
+    )
+    tasks = []
+    ssd = _guild_data(tmp_path, tasks, channel)
+    _run_tasks(tasks, "MB_LoadGuildOptions")
+    return ssd, tasks
+
+
+def test_card_from_before_a_restart_is_deleted(tmp_path):
+    deleted = []
+    ssd, tasks = _stale_setup(tmp_path, deleted)
+    assert [n for n, _ in tasks] == ["MB_DeleteStaleCard"]
+    _run_tasks(tasks, "MB_DeleteStaleCard")
+    assert deleted == [50]
+    saved = _saved(tmp_path)
+    assert saved["np_card"] == [0, 0]
+    assert saved["command_prefix"] == "?"  # the rest of the file survives
+
+
+def test_a_newer_card_is_kept(tmp_path):
+    deleted = []
+    ssd, tasks = _stale_setup(tmp_path, deleted)
+    ssd.np_controls_msg = _card_msg(60)  # music resumed before the cleanup ran
+    _run_tasks(tasks, "MB_DeleteStaleCard")
+    assert deleted == [50]
+    assert ssd._np_card_ids == (3, 60)
+
+
+def test_older_data_files_load_quietly(tmp_path, caplog):
+    import json
+
+    (tmp_path / "1").mkdir(exist_ok=True)
+    (tmp_path / "1" / "options.json").write_text(
+        json.dumps({"command_prefix": "", "last_np_ch_id": 3}), encoding="utf8"
+    )
+    tasks = []
+    _guild_data(tmp_path, tasks)
+    with caplog.at_level("WARNING"):
+        _run_tasks(tasks, "MB_LoadGuildOptions")
+    assert "np_card" not in caplog.text
+    assert tasks == []
