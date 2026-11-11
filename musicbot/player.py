@@ -733,7 +733,10 @@ class MusicPlayer(EventEmitter, Serializable):
                         log.warning("Voice is not connected, cannot start playback.")
                         self.playlist.entries.appendleft(entry)
                         return
-                    self.emit("error", player=self, entry=entry, ex=e)
+                    # starting=True: a failure to start playback (e.g. ffmpeg
+                    # missing) says nothing about the track, so on_player_error
+                    # keeps it in the autoplaylist file.
+                    self.emit("error", player=self, entry=entry, ex=e, starting=True)
                     return
 
                 self._current_player = self.voice_client
@@ -749,7 +752,9 @@ class MusicPlayer(EventEmitter, Serializable):
         A helper used to clean up media files via call-later, when file
         cache is not enabled.
         """
-        if not isinstance(entry, StreamPlaylistEntry):
+        # A local media entry's filename is the user's own file, not a cached
+        # download, so it is never deleted.
+        if not isinstance(entry, (StreamPlaylistEntry, LocalFilePlaylistEntry)):
             if any(entry.filename == e.filename for e in self.playlist.entries):
                 log.debug(
                     "Skipping deletion of '%s', found song in queue",

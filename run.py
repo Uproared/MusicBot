@@ -1150,6 +1150,9 @@ def main() -> None:
                 # fmt: on
                 {"py_bin": sys.executable},
             )
+            # Exit 1 as before Batch 1, so systemd's Restart=on-failure retries
+            # (e.g. if update.sh was still replacing packages).
+            exit_signal = TerminateSignal(exit_code=1)
             break
 
         except HelpfulError as e:

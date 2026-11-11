@@ -1611,10 +1611,12 @@ class MusicBot(discord.Client):
         player: MusicPlayer,
         entry: Optional[EntryTypes],
         ex: Optional[Exception],
+        starting: bool = False,
         **_: Any,
     ) -> None:
         """
         Event called by MusicPlayer when an entry throws an error.
+        `starting` is set when playback could not be started at all.
         """
         # Log the exception according to entry or bare error.
         if entry is not None:
@@ -1657,11 +1659,15 @@ class MusicBot(discord.Client):
             log.info("Auto playlist track could not be played:  %r", entry)
             guild = player.voice_client.guild
             # ffmpeg failures are usually transient (expired stream URL, network),
-            # so drop the track for this session but keep it in the playlist file.
+            # and a failure to start playback (ffmpeg missing, probe failed) is
+            # about this machine, not the track. Either way drop the track for
+            # this session but keep it in the playlist file; otherwise a missing
+            # ffmpeg would empty the file one track at a time.
             await self.server_data[guild.id].autoplaylist.remove_track(
                 entry.info.input_subject,
                 ex=ex,
                 delete_from_ap=self.config.remove_ap
+                and not starting
                 and not isinstance(ex, exceptions.FFmpegError),
             )
 
@@ -8141,6 +8147,11 @@ class MusicBot(discord.Client):
                 fmt_args={"raw_error": e},
             ) from e
         except OSError as e:
+            # Don't leave a partly written copy of the cookies behind.
+            try:
+                upload_path.unlink(missing_ok=True)
+            except OSError:
+                log.warning("Could not remove %s", upload_path, exc_info=True)
             raise exceptions.CommandError(
                 "Could not save cookies to disk:  %(raw_error)s",
                 fmt_args={"raw_error": e},
@@ -8527,7 +8538,14 @@ class MusicBot(discord.Client):
             # These change the queue without a track event that would save it,
             # so a restart brought cleared/removed songs back (upstream #2305).
             if command in ("clear", "remove", "shuffle", "move") and message.guild:
-                await self.serialize_queue(message.guild)
+                # The command already worked; a failed save (disk full, file
+                # locked) mustn't turn its reply into "Something went wrong".
+                try:
+                    await self.serialize_queue(message.guild)
+                except OSError:
+                    log.warning(
+                        "Could not save the queue after `%s`.", command, exc_info=True
+                    )
 
             if response and isinstance(response, MusicBotResponse):
                 # Set a default response title if none is set.
