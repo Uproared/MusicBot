@@ -156,7 +156,8 @@ def run_play(path, loop, voice, *, use_opus=True, use_opus_probe=False, wait=Tru
     from musicbot.player import MusicPlayer
 
     queued = SimpleNamespace(
-        filename=path, probed_codec=None, probed_bitrate=0, start_time=0, playback_speed=1.0
+        filename=path, probed_codec=None, probed_bitrate=0, start_time=0, playback_speed=1.0,
+        title="test tone",
     )
 
     class Playlist:
