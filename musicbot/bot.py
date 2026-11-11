@@ -1390,8 +1390,14 @@ class MusicBot(discord.Client):
         # delete last_np_msg somewhere if we have cached it
         if self.config.delete_nowplaying:
             guild = player.voice_client.guild
-            last_np_msg = self.server_data[guild.id].last_np_msg
+            ssd = self.server_data[guild.id]
+            last_np_msg = ssd.last_np_msg
             if last_np_msg:
+                # The card goes, and its buttons with it: no edit needed.
+                if ssd.np_controls_msg is not None and (
+                    ssd.np_controls_msg.id == last_np_msg.id
+                ):
+                    await self._retire_np_controls(guild, edit=False)
                 await self.safe_delete_message(last_np_msg)
 
         if self.config.leave_after_queue_empty:
@@ -2049,6 +2055,8 @@ class MusicBot(discord.Client):
         if msg is not None and edit:
             try:
                 await msg.edit(view=None)
+            except discord.NotFound:
+                pass  # already deleted, e.g. by DeleteMessages
             except discord.HTTPException:
                 log.debug("Could not remove the buttons from an old card.", exc_info=True)
 
