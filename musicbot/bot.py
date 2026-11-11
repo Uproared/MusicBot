@@ -86,6 +86,7 @@ from .utils import (
     is_empty_voice_channel,
     owner_only,
     slugify,
+    youtube_playlist_in_link,
 )
 
 # optional imports
@@ -4377,14 +4378,11 @@ class MusicBot(discord.Client):
         # Check for playlist in youtube watch link.
         # https://youtu.be/VID?list=PLID
         # https://www.youtube.com/watch?v=VID&list=PLID
-        playlist_regex = re.compile(
-            r"(?:youtube.com/watch\?v=|youtu\.be/)([^?&]{6,})[&?]{1}(list=PL[^&]+)",
-            re.I | re.X,
-        )
-        matches = playlist_regex.search(song_url)
-        if matches:
-            pl_url = "https://www.youtube.com/playlist?" + matches.group(2)
-            ignore_vid = matches.group(1)
+        # The old regex only matched list=PL... right after the video ID, so
+        # albums (list=OLAK5uy_...) and reordered links got no prompt.
+        found = youtube_playlist_in_link(song_url)
+        if found:
+            ignore_vid, pl_url = found
             self.create_task(
                 _prompt_for_playing(
                     _D(

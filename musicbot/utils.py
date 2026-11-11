@@ -4,6 +4,7 @@ import logging
 import pathlib
 import re
 import unicodedata
+import urllib.parse
 from functools import wraps
 from typing import (
     TYPE_CHECKING,
@@ -14,6 +15,7 @@ from typing import (
     List,
     Optional,
     Set,
+    Tuple,
     TypeVar,
     Union,
 )
@@ -518,3 +520,36 @@ def check_extractor(target: str, contains: str) -> bool:
     """Tests extractor string for containing the given extractor parts."""
     parts = contains.split(":")
     return all(p in target for p in parts)
+
+
+def youtube_playlist_in_link(url: str) -> Optional[Tuple[str, str]]:
+    """
+    For a YouTube video link that also names a playlist, return
+    (video ID, playlist page URL), else None.
+
+    Reads the query properly, so the order of `v` and `list` doesn't matter,
+    and accepts any playlist ID (albums are OLAK5uy_..., not PL...) on
+    youtube.com, its subdomains (music., m.) and youtu.be.
+    Mixes (list=RD...) are left out: YouTube refuses them as a playlist page
+    ("This playlist type is unviewable"), and a full mix is hundreds of tracks.
+    """
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower()
+    query = urllib.parse.parse_qs(parsed.query)
+    playlist_id = (query.get("list") or [""])[0]
+
+    if host == "youtu.be":
+        video_id = parsed.path.strip("/")
+    elif (host == "youtube.com" or host.endswith(".youtube.com")) and (
+        parsed.path == "/watch"
+    ):
+        video_id = (query.get("v") or [""])[0]
+    else:
+        return None
+
+    if not video_id or not playlist_id or playlist_id.upper().startswith("RD"):
+        return None
+    playlist_url = "https://www.youtube.com/playlist?" + urllib.parse.urlencode(
+        {"list": playlist_id}
+    )
+    return video_id, playlist_url
