@@ -280,3 +280,25 @@ def test_create_closes_pipe_when_source_fails():
     with pytest.raises(RuntimeError):
         FFmpegStderrReader("x").create(Boom, "x")
     assert seen["stderr"].closed
+
+
+def test_source_start_failure_is_marked_as_starting(
+    media, current_loop, event_loop_thread, monkeypatch
+):
+    """Review #1: on_player_error must be able to tell a start failure apart."""
+    from musicbot.player import MusicPlayer
+
+    seen = []
+    real_emit = MusicPlayer.emit
+
+    def emit(self, event, *args, **kwargs):
+        if event == "error":
+            seen.append(kwargs.get("starting"))
+        return real_emit(self, event, *args, **kwargs)
+
+    monkeypatch.setattr(MusicPlayer, "emit", emit)
+    voice = FakePlayVoiceClient(
+        event_loop_thread, play_error=ClientException("ffmpeg was not found.")
+    )
+    run_play(media["good"], current_loop, voice, wait=False)
+    assert seen == [True]
