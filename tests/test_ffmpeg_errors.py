@@ -5,13 +5,15 @@ These run the real ffmpeg through discord.py 2.7.1's real audio sources and
 AudioPlayer thread; only the voice connection is a stand-in.
 """
 
+import asyncio
 import logging
 import os
 import threading
+from collections import deque
 from types import SimpleNamespace
 
 import pytest
-from discord import FFmpegOpusAudio, FFmpegPCMAudio, PCMVolumeTransformer
+from discord import ClientException, FFmpegOpusAudio, FFmpegPCMAudio, PCMVolumeTransformer
 from discord.player import AudioPlayer
 
 from musicbot.exceptions import FFmpegError
@@ -128,12 +130,19 @@ def test_audio_player_passes_error_to_after(case, expect_error, media, event_loo
 class FakePlayVoiceClient(FakeVoiceClient):
     """Adds VoiceClient.play(): runs discord.py's real AudioPlayer thread."""
 
-    def __init__(self, loop):
+    def __init__(self, loop, connected=True, play_error=None):
         super().__init__(loop)
         self.channel = SimpleNamespace(bitrate=64000)
         self.audio_player = None
+        self.connected = connected
+        self.play_error = play_error
+
+    def is_connected(self):
+        return self.connected
 
     def play(self, source, *, after=None):
+        if self.play_error:
+            raise self.play_error
         self.audio_player = AudioPlayer(source, self, after=after)
         self.audio_player.start()
 
@@ -142,24 +151,17 @@ class FakePlayVoiceClient(FakeVoiceClient):
             self.audio_player.stop()
 
 
-@pytest.mark.parametrize("use_opus", [True, False])
-@pytest.mark.parametrize("case,expect_error", [("missing", True), ("good", False)])
-def test_music_player_play_end_to_end(
-    use_opus, case, expect_error, media, current_loop, event_loop_thread
-):
-    """MusicPlayer._play -> ffmpeg -> AudioPlayer -> _playback_finished -> events."""
+def run_play(path, loop, voice, *, use_opus=True, use_opus_probe=False, wait=True):
+    """Drive MusicPlayer._play for one queued entry and collect its events."""
     from musicbot.player import MusicPlayer
 
     queued = SimpleNamespace(
-        filename=media[case],
-        probed_codec=None,
-        probed_bitrate=96,  # skip the ffprobe step
-        start_time=0,
-        playback_speed=1.0,
+        filename=path, probed_codec=None, probed_bitrate=0, start_time=0, playback_speed=1.0
     )
 
     class Playlist:
-        entries = []
+        def __init__(self):
+            self.entries = deque()
 
         def on(self, *_args):
             return self
@@ -171,30 +173,79 @@ def test_music_player_play_end_to_end(
             return queued
 
     bot = SimpleNamespace(
-        loop=current_loop,
+        loop=loop,
         config=SimpleNamespace(
             default_volume=0.15,
             use_opus_audio=use_opus,
-            use_opus_probe=False,
+            use_opus_probe=use_opus_probe,
             save_videos=True,
         ),
     )
-    voice = FakePlayVoiceClient(event_loop_thread)
     player = MusicPlayer(bot, voice, Playlist())
     events = []
-    done = threading.Event()
-    player.on("error", lambda **kw: (events.append(("error", kw["ex"])), done.set()))
-    player.on("finished-playing", lambda **kw: (events.append(("finished", None)), done.set()))
+    player.on("error", lambda **kw: events.append(("error", kw["ex"])))
+    player.on("finished-playing", lambda **kw: events.append(("finished", None)))
 
-    current_loop.run_until_complete(player._play())
-    assert done.wait(20), "playback never finished"
-    voice.audio_player.join(5)
+    async def run():
+        await player._play()
+        # The end of playback is handed to this loop (B1), so keep it running.
+        for _ in range(400):
+            if events or not wait:
+                return
+            await asyncio.sleep(0.05)
+
+    loop.run_until_complete(run())
+    if voice.audio_player:
+        voice.audio_player.join(5)
+    return player, events, queued
+
+
+@pytest.mark.parametrize("use_opus", [True, False])
+@pytest.mark.parametrize("case,expect_error", [("missing", True), ("good", False)])
+def test_music_player_play_end_to_end(
+    use_opus, case, expect_error, media, current_loop, event_loop_thread
+):
+    """MusicPlayer._play -> ffmpeg -> AudioPlayer -> _playback_finished -> events."""
+    voice = FakePlayVoiceClient(event_loop_thread)
+    _, events, _ = run_play(media[case], current_loop, voice, use_opus=use_opus)
 
     if expect_error:
+        # With UseOpusAudio and no UseOpusProbe there's no probe any more, so a
+        # missing file now reaches ffmpeg and is reported (it used to hit B3).
         assert events[0][0] == "error" and isinstance(events[0][1], FFmpegError)
     else:
         assert events == [("finished", None)]
         assert voice.packets > 50
+
+
+def test_failed_probe_no_longer_crashes(media, current_loop, event_loop_thread):
+    """B3: a failed probe returned (None, None) and min(bitrate, None) raised TypeError."""
+    voice = FakePlayVoiceClient(event_loop_thread)
+    _, events, queued = run_play(
+        media["missing"], current_loop, voice, use_opus_probe=True
+    )
+    assert queued.probed_codec is None
+    assert events[0][0] == "error" and isinstance(events[0][1], FFmpegError)
+
+
+def test_source_start_failure_is_reported(media, current_loop, event_loop_thread):
+    boom = ClientException("Already playing audio.")
+    voice = FakePlayVoiceClient(event_loop_thread, play_error=boom)
+    player, events, _ = run_play(media["good"], current_loop, voice, wait=False)
+    assert events == [("error", boom)]
+    assert player.is_stopped and player._source is None
+    assert not player.playlist.entries
+
+
+def test_source_start_without_voice_keeps_the_entry(media, current_loop, event_loop_thread):
+    """No error event: on_player_error would start the next entry, which fails too."""
+    voice = FakePlayVoiceClient(
+        event_loop_thread, connected=False, play_error=ClientException("Not connected to voice.")
+    )
+    player, events, queued = run_play(media["good"], current_loop, voice, wait=False)
+    assert events == []
+    assert list(player.playlist.entries) == [queued]
+    assert player.is_stopped
 
 
 def test_summary_hides_urls_and_paths():

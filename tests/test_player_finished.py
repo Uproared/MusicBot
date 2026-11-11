@@ -1,5 +1,5 @@
 """
-B10 and the S1 follow-ups in MusicPlayer._playback_finished and
+B10 and the S1 follow-ups in MusicPlayer._on_playback_finished and
 MusicBot.on_player_error, with stand-ins for the bot, playlist and entries.
 """
 
@@ -49,7 +49,7 @@ def test_repeat_requeues_after_success(current_loop):
     player, events = make_player(current_loop)
     player.repeatsong = True
     player._current_entry = a
-    player._playback_finished(None)
+    player._on_playback_finished(None)
     assert list(player.playlist.entries) == [a]
     assert events == [("finished", a)]
 
@@ -59,7 +59,7 @@ def test_repeat_does_not_loop_a_failed_track(current_loop):
     player, events = make_player(current_loop)
     player.repeatsong = True
     player._current_entry = a
-    player._playback_finished(exceptions.FFmpegError("x"))
+    player._on_playback_finished(exceptions.FFmpegError("x"))
     assert not player.playlist.entries
     assert events == [("error", a)]
 
@@ -69,7 +69,7 @@ def test_loopqueue_drops_a_failed_track(current_loop):
     player, _ = make_player(current_loop, b)
     player.loopqueue = True
     player._current_entry = a
-    player._playback_finished(exceptions.FFmpegError("x"))
+    player._on_playback_finished(exceptions.FFmpegError("x"))
     assert list(player.playlist.entries) == [b]
 
 
@@ -80,7 +80,7 @@ def test_seek_restart_is_not_queued_twice(current_loop, mode):
     player, events = make_player(current_loop, a, b)
     setattr(player, mode, True)
     player._current_entry = a
-    player._playback_finished(None)
+    player._on_playback_finished(None)
     assert list(player.playlist.entries) == [a, b]
     assert events == [("finished", a)]
 
@@ -90,8 +90,43 @@ def test_media_file_cleanup_runs_even_on_error(current_loop, error):
     a = entry("a")
     player, _ = make_player(current_loop, save_videos=False)
     player._current_entry = a
-    player._playback_finished(error)
+    player._on_playback_finished(error)
     assert player.bot.tasks == ["MB_CacheCleanup"]
+
+
+def test_audio_thread_callback_runs_on_the_event_loop(current_loop):
+    """B1: discord.py's `after` runs on its audio thread; the work must not run there."""
+    import threading
+
+    a = entry("a")
+    player, events = make_player(current_loop)
+    player._current_entry = a
+    ran_on = []
+    original = player._on_playback_finished
+    player._on_playback_finished = lambda *args: (
+        ran_on.append(threading.current_thread()),
+        original(*args),
+    )
+
+    t = threading.Thread(target=player._playback_finished, args=(None,))
+    t.start()
+    t.join(5)
+    assert not events, "the audio thread must only hand off the work"
+
+    current_loop.run_until_complete(asyncio.sleep(0.05))
+    assert events == [("finished", a)]
+    assert ran_on == [threading.main_thread()]
+
+
+def test_end_of_a_replaced_source_is_ignored(current_loop):
+    a = entry("a")
+    old_source, new_source = object(), object()
+    player, events = make_player(current_loop)
+    player._current_entry = a
+    player._source = new_source
+    player._on_playback_finished(None, old_source)
+    assert not events
+    assert player._current_entry is a and player._source is new_source
 
 
 @pytest.mark.parametrize(
