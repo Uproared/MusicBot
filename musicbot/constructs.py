@@ -106,6 +106,8 @@ class GuildSpecificData:
         # The song the button card was made for; its progress bar is only
         # redrawn while that song plays.
         self.np_controls_entry: Optional[Any] = None
+        # The one queue list message; a new `queue` replaces it (polish).
+        self.queue_msg: Optional[discord.Message] = None
         self.last_played_song_subject: str = ""
         self.follow_user: Optional[discord.Member] = None
         self.auto_join_channel: Optional[

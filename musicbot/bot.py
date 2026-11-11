@@ -7059,10 +7059,20 @@ class MusicBot(discord.Client):
         if update_msg:
             q_msg = await self.safe_edit_message(update_msg, embed, send_if_fail=True)
         else:
-            if pages_total <= 1:
+            # Only one queue message per server (polish): a new one replaces
+            # the last, so the button or the command can't flood the channel.
+            ssd = self.server_data[guild.id]
+            async with self.aiolocks[f"queue_msg:{guild.id}"]:
+                old, ssd.queue_msg = ssd.queue_msg, None
+                if old is not None:
+                    try:
+                        await old.delete()
+                    except discord.NotFound:
+                        pass  # already gone: timed out, or deleted by hand
+                    except discord.HTTPException:
+                        log.debug("Could not delete the old queue message.", exc_info=True)
                 q_msg = await self.safe_send_message(channel, embed)
-            else:
-                q_msg = await self.safe_send_message(channel, embed)
+                ssd.queue_msg = q_msg
 
         if pages_total <= 1:
             log.debug("Not enough entries to paginate the queue.")
@@ -7115,7 +7125,11 @@ class MusicBot(discord.Client):
                 await self.safe_delete_message(q_msg)
 
         except asyncio.TimeoutError:
-            await self.safe_delete_message(q_msg)
+            # Unless a newer `queue` already replaced (and deleted) it.
+            current = self.server_data[guild.id].queue_msg
+            if current is not None and current.id == q_msg.id:
+                self.server_data[guild.id].queue_msg = None
+                await self.safe_delete_message(q_msg)
 
         return None
 
