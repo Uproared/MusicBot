@@ -4862,19 +4862,49 @@ class MusicBot(discord.Client):
                     "reaction_add", timeout=60, check=_check_react
                 )
                 if reaction.emoji == EMOJI_CHECK_MARK_BUTTON:
-                    await self._cmd_play(
-                        message,
-                        player,
-                        channel,
-                        guild,
-                        author,
-                        permissions,
-                        leftover_args,
-                        next_url,
-                        head,
-                        ignore_video_id=ignore_vid,
-                    )
-                    await self.safe_delete_message(msg)
+                    # This runs in a task, outside on_message's error handling:
+                    # a failure (a dead playlist, MaxSongs) went unanswered, and
+                    # the "added" reply was dropped. Both are sent now.
+                    reply: Optional[MusicBotResponse] = None
+                    try:
+                        reply = await self._cmd_play(
+                            message,
+                            player,
+                            channel,
+                            guild,
+                            author,
+                            permissions,
+                            leftover_args,
+                            next_url,
+                            head,
+                            ignore_video_id=ignore_vid,
+                        )
+                    except exceptions.MusicbotException as e:
+                        log.warning(
+                            "Queueing the linked playlist failed: %s",
+                            _L(e.message) % e.fmt_args,
+                        )
+                        reply = ErrorResponse(
+                            _D(e.message, ssd_) % e.fmt_args,
+                            codeblock=None if self.config.embeds else "text",
+                        )
+                        reply.set_author(name=command_header("play", error=True))
+                    except Exception as e:  # pylint: disable=broad-exception-caught
+                        log.exception("Queueing the linked playlist failed.")
+                        reply = ErrorResponse(
+                            _D(
+                                "Something went wrong running `%(command)s` (%(error)s). "
+                                "Details are in the bot's log.",
+                                ssd_,
+                            )
+                            % {"command": "play", "error": type(e).__name__}
+                        )
+                        reply.set_author(name=command_header("play", error=True))
+                    finally:
+                        await self.safe_delete_message(msg)
+                    if reply is not None:
+                        reply.reply_to = message
+                        await self.safe_send_message(channel, reply)
                 elif reaction.emoji == EMOJI_CROSS_MARK_BUTTON:
                     await self.safe_delete_message(msg)
             except asyncio.TimeoutError:
