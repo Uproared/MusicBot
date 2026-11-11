@@ -5,6 +5,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, DefaultDict, Dict, List, Tuple
 
+from . import write_path
 from .constants import DEFAULT_COMMAND_ALIAS_FILE, EXAMPLE_COMMAND_ALIAS_FILE
 from .exceptions import HelpfulError
 
@@ -227,6 +228,7 @@ class Aliases:
 
 
 class AliasesDefault:
-    aliases_file: Path = Path(DEFAULT_COMMAND_ALIAS_FILE)
+    # write_path: honour --write-dir like the options and permissions files (B12).
+    aliases_file: Path = write_path(DEFAULT_COMMAND_ALIAS_FILE)
     aliases_seed: RawAliasJSON = {}
     complex_aliases: AliasesDict = {}

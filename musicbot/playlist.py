@@ -216,7 +216,15 @@ class Playlist(EventEmitter, Serializable):
                     log.warning(
                         "Got text/html for content-type, this might be a stream."
                     )
-                    return await self.add_stream_from_info(info, head=head)
+                    # B12: pass the requester along; without it the entry
+                    # looked like an autoplaylist entry.
+                    return await self.add_stream_from_info(
+                        info,
+                        author=author,
+                        channel=channel,
+                        head=head,
+                        defer_serialize=defer_serialize,
+                    )
                     # TODO: Check for shoutcast/icecast
 
                 elif not content_type.startswith(("audio/", "video/")):

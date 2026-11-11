@@ -264,6 +264,11 @@ class MusicBot(discord.Client):
 
         def discard_task(task: AsyncTask) -> None:
             """Clean up the spawned task and handle its exceptions."""
+            # exception() raises CancelledError on a cancelled task, which
+            # skipped the discard below and logged "Exception in callback".
+            if task.cancelled():
+                self.task_pool.discard(task)
+                return
             ex = task.exception()
             if ex:
                 if log.getEffectiveLevel() <= logging.DEBUG:
@@ -1147,7 +1152,8 @@ class MusicBot(discord.Client):
                     ssd_,
                 ) % {
                     "title": _D(entry.title, ssd_),
-                    "author": entry.author.name,
+                    # B5: was "author", a KeyError that stopped the skip.
+                    "user": entry.author.name,
                 }
 
                 # handle history playlist updates.
@@ -1367,18 +1373,21 @@ class MusicBot(discord.Client):
             )
             return
 
-        if self.config.leave_after_queue_empty:
-            guild = player.voice_client.guild
-            if len(player.playlist.entries) == 0:
-                log.info("Player finished and queue is empty, leaving voice channel...")
-                await self.disconnect_voice_client(guild)
-
         # delete last_np_msg somewhere if we have cached it
         if self.config.delete_nowplaying:
             guild = player.voice_client.guild
             last_np_msg = self.server_data[guild.id].last_np_msg
             if last_np_msg:
                 await self.safe_delete_message(last_np_msg)
+
+        if self.config.leave_after_queue_empty:
+            guild = player.voice_client.guild
+            if len(player.playlist.entries) == 0:
+                log.info("Player finished and queue is empty, leaving voice channel...")
+                await self.disconnect_voice_client(guild)
+                # B12: the rest (absent-author purge, autoplaylist) would run
+                # on the player that was just killed.
+                return
 
         # avoid downloading the next entries if the user is absent and we are configured to skip.
         notice_sent = False  # set a flag to avoid message spam.
@@ -2900,8 +2909,9 @@ class MusicBot(discord.Client):
                     "channel": event_channel_name,
                 },
             )
-            await discord.utils.sane_wait_for(
-                [event.wait()], timeout=self.config.leave_inactive_channel_timeout
+            # wait_for cancels event.wait() on timeout; sane_wait_for left it pending.
+            await asyncio.wait_for(
+                event.wait(), timeout=self.config.leave_inactive_channel_timeout
             )
         except asyncio.TimeoutError:
             # could timeout after a disconnect.
@@ -2962,8 +2972,9 @@ class MusicBot(discord.Client):
                     "channel": channel.name,
                 },
             )
-            await discord.utils.sane_wait_for(
-                [event.wait()], timeout=self.config.leave_player_inactive_for
+            # wait_for cancels event.wait() on timeout; sane_wait_for left it pending.
+            await asyncio.wait_for(
+                event.wait(), timeout=self.config.leave_player_inactive_for
             )
         except asyncio.TimeoutError:
             if not player.is_playing and player.voice_client.is_connected():
@@ -3552,7 +3563,9 @@ class MusicBot(discord.Client):
             pl = self.playlist_mgr.get_playlist(opt_url)
             self.server_data[guild.id].autoplaylist = pl
             await self.server_data[guild.id].save_guild_options_file()
-            await pl.load()
+            # force: re-read a list that was already loaded, so edits made to
+            # the file meanwhile are picked up (B12, upstream PR #2476).
+            await pl.load(force=True)
 
             # Update the player copy if needed.
             if _player and self.config.auto_playlist:
@@ -4582,7 +4595,9 @@ class MusicBot(discord.Client):
 
                 if (
                     permissions.max_song_length
-                    and info.duration_td.seconds > permissions.max_song_length
+                    # total_seconds(): .seconds drops whole days (B12).
+                    and info.duration_td.total_seconds()
+                    > permissions.max_song_length
                 ):
                     raise exceptions.PermissionsError(
                         "Song duration exceeds limit (%(length)s > %(max)s)",
@@ -5842,7 +5857,8 @@ class MusicBot(discord.Client):
 
         try:
             speed = float(new_speed)
-            if speed < 0.5 or speed > 100.0:
+            # Written so NaN fails too (every NaN comparison is false), B12.
+            if not 0.5 <= speed <= 100.0:
                 raise ValueError("Value out of range.")
         except (ValueError, TypeError) as e:
             raise exceptions.CommandError(
@@ -7586,16 +7602,18 @@ class MusicBot(discord.Client):
         """
         Forces the bot to leave a server.
         """
+        # B12: a one-word name was refused (guild_name was only set for
+        # several words), and a name reached `leave_guild is None` unassigned.
         guild_id = 0
-        guild_name = ""
-        if leftover_args:
-            guild_name = " ".join([val, *leftover_args])
+        guild_name = " ".join([val, *leftover_args]).strip()
+        leave_guild: Optional[discord.Guild] = None
+        if not guild_name:
+            raise exceptions.CommandError("You must provide an ID or name.")
 
         try:
             guild_id = int(val)
-        except ValueError as e:
-            if not guild_name:
-                raise exceptions.CommandError("You must provide an ID or name.") from e
+        except ValueError:
+            pass
 
         if guild_id:
             leave_guild = self.get_guild(guild_id)
@@ -7607,7 +7625,7 @@ class MusicBot(discord.Client):
         if leave_guild is None:
             raise exceptions.CommandError(
                 "No guild was found with the ID or name `%(input)s`",
-                fmt_args={"input": val},
+                fmt_args={"input": guild_name},
             )
 
         await leave_guild.leave()
@@ -8356,9 +8374,11 @@ class MusicBot(discord.Client):
         self_mention = "<@MusicBot>"  # placeholder
         if self.user:
             self_mention = f"<@{self.user.id}>"
-        if not message_content.startswith(command_prefix) and (
+        # B11: with mentions off, the old check never returned, so text like
+        # ".skip" or "-play x" ran as commands with the first character cut.
+        if not message_content.startswith(command_prefix) and not (
             self.config.commands_via_mention
-            and not message_content.startswith(self_mention)
+            and message_content.startswith(self_mention)
         ):
             return
 
@@ -8476,7 +8496,7 @@ class MusicBot(discord.Client):
             # TODO:  maybe add a config option to enable telling users they are blocked.
             log.warning(
                 "User in block list: %(id)s/%(name)s  tried command: %(command)s",
-                {"id": message.author.id, "name": message.author, "comand": command},
+                {"id": message.author.id, "name": message.author, "command": command},
             )
             return
 
@@ -9285,8 +9305,11 @@ class MusicBot(discord.Client):
             if before.user_limit != after.user_limit:
                 changes += f" user-limit = {after.user_limit}"
         # The chat delay is not currently respected by MusicBot. Is this a problem?
-        if before.slowmode_delay != after.slowmode_delay:
-            changes += f" slowmode = {after.slowmode_delay}"
+        # getattr: CategoryChannel has no slowmode_delay (AttributeError, B12).
+        before_slowmode = getattr(before, "slowmode_delay", None)
+        after_slowmode = getattr(after, "slowmode_delay", None)
+        if before_slowmode != after_slowmode:
+            changes += f" slowmode = {after_slowmode}"
 
         if changes:
             log.info(
