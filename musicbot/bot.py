@@ -1336,14 +1336,19 @@ class MusicBot(discord.Client):
 
         # Don't send the same now-playing message more than once.
         # This prevents repeated messages when players reconnect.
+        # Only while that song's card still exists (polish): with DeleteNowPlaying
+        # it's deleted when the song ends, and replaying the same song (or repeat)
+        # then got no card at all.
         last_subject = self.server_data[guild.id].last_played_song_subject
         if (
             last_np_msg is not None
             and player.current_entry is not None
             and last_subject
             and last_subject == player.current_entry.url
+            and ssd_.np_controls_msg is not None
         ):
             log.debug("ignored now-playing message as it was already posted.")
+            ssd_.np_controls_entry = entry  # keep that card's progress bar moving
             return
 
         if player.current_entry:
