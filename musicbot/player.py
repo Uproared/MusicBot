@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -415,16 +416,43 @@ class MusicPlayer(EventEmitter, Serializable):
         self._events.clear()
         self._kill_current_player()
 
-    def _playback_finished(self, error: Optional[Exception] = None) -> None:
+    def _playback_finished(
+        self,
+        error: Optional[Exception] = None,
+        source: Optional[SourcePlaybackCounter] = None,
+    ) -> None:
         """
-        Event fired by discord.VoiceClient after playback has finished
-        or when playback stops due to an error.
+        Called by discord.py on its audio thread when playback ends or fails.
+        asyncio isn't thread-safe, so the work is handed to the event loop
+        (B1: tasks created from this thread could sit unscheduled).
+
+        :param: error:  An exception, if any, raised by playback.
+        :param: source:  The source that finished, bound in _play().
+        """
+        try:
+            self.loop.call_soon_threadsafe(self._on_playback_finished, error, source)
+        except RuntimeError:
+            log.debug("Playback finished after the event loop closed.")
+
+    def _on_playback_finished(
+        self,
+        error: Optional[Exception] = None,
+        source: Optional[SourcePlaybackCounter] = None,
+    ) -> None:
+        """
+        Runs on the event loop after playback has finished or failed.
         This function is responsible tidying the queue post-playback,
         propagating player error or finished-playing events, and
         triggering the media file cleanup task.
 
         :param: error:  An exception, if any, raised by playback.
+        :param: source:  The source that finished. If another source has
+            replaced it since, this call is stale and ignored.
         """
+        if source is not None and source is not self._source:
+            log.debug("Ignoring the end of a source that was already replaced.")
+            return
+
         entry = self._current_entry
         if entry is None:
             log.debug("Playback finished, but _current_entry is None.")
@@ -566,67 +594,87 @@ class MusicPlayer(EventEmitter, Serializable):
                     entry.set_audio_filter("volume", f"{self.volume:.2f}")
                     aoptions += f" {entry.get_audio_filters()}"
 
-                stderr_reader = FFmpegStderrReader(entry.filename)
+                counter: Optional[SourcePlaybackCounter] = None
+                try:
+                    stderr_reader = FFmpegStderrReader(entry.filename)
 
-                if self.bot.config.use_opus_probe or self.bot.config.use_opus_audio:
-                    # Note: ffmpeg filters require encoding to work.
-                    # So copy codec will not allow speed, volume or other filters.
-                    if (
-                        self.bot.config.use_opus_probe and not entry.probed_codec
-                    ) or not entry.probed_bitrate:
-                        codec, bitrate = await FFmpegOpusAudio.probe(
+                    if self.bot.config.use_opus_probe or self.bot.config.use_opus_audio:
+                        # Note: ffmpeg filters require encoding to work.
+                        # So copy codec will not allow speed, volume or other filters.
+                        # Probe only when its codec is used (UseOpusProbe). discord.py
+                        # never reports less than 512 kbps, so the probed bitrate can't
+                        # lower the result below; without UseOpusProbe the probe only
+                        # cost an ffprobe run per track, and a failed one crashed (B3).
+                        if self.bot.config.use_opus_probe and not entry.probed_codec:
+                            codec, bitrate = await FFmpegOpusAudio.probe(
+                                entry.filename,
+                                method="native",
+                            )
+                            log.everything(  # type: ignore[attr-defined]
+                                "Probed codec and bitrate: %(name)s at %(rate)s kbps",
+                                {"name": codec, "rate": bitrate},
+                            )
+                            # If the probe returned opus, libopus, or copy, copy is used.
+                            entry.probed_codec = codec
+                            if bitrate:
+                                entry.probed_bitrate = bitrate
+
+                        # Determine bitrate to use based on probe, channel setting, and bot limit.
+                        vc_kbitrate = self.voice_client.channel.bitrate / 1000
+                        kbitrate = min(vc_kbitrate, entry.probed_bitrate or vc_kbitrate)
+                        kbitrate = min(kbitrate, MUSICBOT_VOICE_MAX_KBITRATE)
+                        source: FFmpegSources = stderr_reader.create(
+                            FFmpegOpusAudio,
                             entry.filename,
-                            method="native",
-                        )
-                        log.everything(  # type: ignore[attr-defined]
-                            "Probed codec and bitrate: %(name)s at %(rate)s kbps",
-                            {"name": codec, "rate": bitrate},
-                        )
-                    if self.bot.config.use_opus_probe and not entry.probed_codec:
-                        # If the probe returned opus, libopus, or copy, copy is used.
-                        entry.probed_codec = codec
-
-                    if not entry.probed_bitrate:
-                        entry.probed_bitrate = bitrate
-
-                    # Determine bitrate to use based on probe, channel setting, and bot limit.
-                    vc_kbitrate = self.voice_client.channel.bitrate / 1000
-                    kbitrate = min(vc_kbitrate, entry.probed_bitrate)
-                    kbitrate = min(kbitrate, MUSICBOT_VOICE_MAX_KBITRATE)
-                    source: FFmpegSources = stderr_reader.create(
-                        FFmpegOpusAudio,
-                        entry.filename,
-                        codec=entry.probed_codec,
-                        bitrate=kbitrate,
-                        before_options=boptions,
-                        options=aoptions,
-                    )
-                else:
-                    source = PCMVolumeTransformer(
-                        stderr_reader.create(
-                            FFmpegPCMAudio,
-                            entry.filename,
+                            codec=entry.probed_codec,
+                            bitrate=kbitrate,
                             before_options=boptions,
                             options=aoptions,
-                        ),
-                        self.volume,
-                    )
+                        )
+                    else:
+                        source = PCMVolumeTransformer(
+                            stderr_reader.create(
+                                FFmpegPCMAudio,
+                                entry.filename,
+                                before_options=boptions,
+                                options=aoptions,
+                            ),
+                            self.volume,
+                        )
 
-                self._source = SourcePlaybackCounter(
-                    source,
-                    start_time=entry.start_time,
-                    playback_speed=entry.playback_speed,
-                    stderr=stderr_reader,
-                )
-                log.ffmpeg(  # type: ignore[attr-defined]
-                    "Creating player with options: ffmpeg %(before)s -i %(input)s %(after)s",
-                    {"before": boptions, "input": entry.filename, "after": aoptions},
-                )
-                log.voicedebug(  # type: ignore[attr-defined]
-                    "Playing %(source)r using %(client)r",
-                    {"source": self._source, "client": self.voice_client},
-                )
-                self.voice_client.play(self._source, after=self._playback_finished)
+                    counter = SourcePlaybackCounter(
+                        source,
+                        start_time=entry.start_time,
+                        playback_speed=entry.playback_speed,
+                        stderr=stderr_reader,
+                    )
+                    self._source = counter
+                    log.ffmpeg(  # type: ignore[attr-defined]
+                        "Creating player with options: ffmpeg %(before)s -i %(input)s %(after)s",
+                        {"before": boptions, "input": entry.filename, "after": aoptions},
+                    )
+                    log.voicedebug(  # type: ignore[attr-defined]
+                        "Playing %(source)r using %(client)r",
+                        {"source": self._source, "client": self.voice_client},
+                    )
+                    self.voice_client.play(
+                        counter,
+                        after=functools.partial(self._playback_finished, source=counter),
+                    )
+                except Exception as e:  # pylint: disable=broad-exception-caught
+                    # Report the failure so on_player_error moves on to the next entry,
+                    # instead of dropping this one silently (B3).
+                    if counter:
+                        counter.cleanup()
+                    self._source = None
+                    self.stop()
+                    if not self.voice_client.is_connected():
+                        # Without voice every queued entry would fail in turn; keep this one.
+                        log.warning("Voice is not connected, cannot start playback.")
+                        self.playlist.entries.appendleft(entry)
+                        return
+                    self.emit("error", player=self, entry=entry, ex=e)
+                    return
 
                 self._current_player = self.voice_client
 
