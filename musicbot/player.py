@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import subprocess
+import time
 from collections import deque
 from enum import Enum
 from threading import Thread
@@ -152,6 +153,16 @@ class MusicPlayerState(Enum):
         return self.name
 
 
+# Late audio packets. discord.py's audio thread sends one packet every 20 ms.
+# A longer gap between two reads means that thread was held up, either by
+# another thread holding the GIL (yt-dlp preparing the next song) or by ffmpeg
+# not keeping up, and listeners may hear a stutter. Longer gaps than
+# LATE_PACKET_MAX are pauses or voice reconnects, which are logged elsewhere.
+LATE_PACKET_GAP = 0.060
+LATE_PACKET_MAX = 2.0
+LATE_PACKET_LOG_EVERY = 5.0  # at most one line per track this often
+
+
 class SourcePlaybackCounter(AudioSource):
     def __init__(
         self,
@@ -159,6 +170,7 @@ class SourcePlaybackCounter(AudioSource):
         start_time: float = 0,
         playback_speed: float = 1.0,
         stderr: Optional[FFmpegStderrReader] = None,
+        label: str = "",
     ) -> None:
         """
         Manage playback source and attempt to count progress frames used
@@ -166,6 +178,7 @@ class SourcePlaybackCounter(AudioSource):
 
         :param: start_time:  A time in seconds that was used in ffmpeg -ss flag.
         :param: stderr:  The reader collecting this source's ffmpeg stderr.
+        :param: label:  The track title, for the late-packet log lines.
         """
         # NOTE: PCMVolumeTransformer will let you set any crazy value.
         # But internally it limits between 0 and 2.0.
@@ -176,6 +189,12 @@ class SourcePlaybackCounter(AudioSource):
         self._is_opus_audio: bool = isinstance(source, FFmpegOpusAudio)
         self._stderr = stderr
         self._error: Optional[Exception] = None
+        self._label = label
+        self._last_read: Optional[float] = None
+        self._late_count: int = 0
+        self._late_worst: float = 0.0
+        self._late_logged_at: float = float("-inf")
+        self._late_summary_done: bool = False
 
     def is_opus(self) -> bool:
         return self._is_opus_audio
@@ -184,9 +203,54 @@ class SourcePlaybackCounter(AudioSource):
         res = self._source.read()
         if res:
             self._num_reads += 1
-        elif self._error is None:
-            self._error = self._check_ffmpeg_exit()
+            self._check_packet_timing()
+        else:
+            if self._error is None:
+                self._error = self._check_ffmpeg_exit()
+            self._log_late_summary()
         return res
+
+    def reset_timing(self) -> None:
+        """Forget the last read, so a pause isn't logged as a late packet."""
+        self._last_read = None
+
+    def _check_packet_timing(self) -> None:
+        """Runs on the audio thread for every packet: one clock reading."""
+        now = time.perf_counter()
+        last, self._last_read = self._last_read, now
+        if last is None:
+            return
+        gap = now - last
+        if gap <= LATE_PACKET_GAP or gap > LATE_PACKET_MAX:
+            return
+        self._late_count += 1
+        self._late_worst = max(self._late_worst, gap)
+        if now - self._late_logged_at >= LATE_PACKET_LOG_EVERY:
+            self._late_logged_at = now
+            pos = self.progress
+            log.info(
+                "Late audio packet: %(gap)d ms after the previous one (normal: 20 ms) "
+                "at %(min)d:%(sec)02d in `%(title)s`.",
+                {
+                    "gap": round(gap * 1000),
+                    "min": pos // 60,
+                    "sec": pos % 60,
+                    "title": self._label,
+                },
+            )
+
+    def _log_late_summary(self) -> None:
+        """Once per track, if any packet was late."""
+        if self._late_count and not self._late_summary_done:
+            self._late_summary_done = True
+            log.info(
+                "Late audio packets in `%(title)s`: %(count)d, worst %(worst)d ms.",
+                {
+                    "title": self._label,
+                    "count": self._late_count,
+                    "worst": round(self._late_worst * 1000),
+                },
+            )
 
     @property
     def _current_error(self) -> Optional[Exception]:
@@ -236,6 +300,7 @@ class SourcePlaybackCounter(AudioSource):
         log.noise(  # type: ignore[attr-defined]
             "Cleanup got called on the audio source:  %r", self
         )
+        self._log_late_summary()  # also for skipped tracks
         self._source.cleanup()
 
     @property
@@ -373,6 +438,10 @@ class MusicPlayer(EventEmitter, Serializable):
             "MusicPlayer.resume() is called:  %s", repr(self)
         )
         if self.is_paused and self._current_player:
+            # Before resuming: the audio thread reads again as soon as it
+            # resumes, and the pause must not look like a late packet.
+            if isinstance(self._source, SourcePlaybackCounter):
+                self._source.reset_timing()
             self._current_player.resume()
             self.state = MusicPlayerState.PLAYING
             self.emit("resume", player=self, entry=self.current_entry)
@@ -706,6 +775,7 @@ class MusicPlayer(EventEmitter, Serializable):
                         start_time=entry.start_time,
                         playback_speed=entry.playback_speed,
                         stderr=stderr_reader,
+                        label=entry.title,
                     )
                     self._source = counter
                     log.ffmpeg(  # type: ignore[attr-defined]
