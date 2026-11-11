@@ -1579,8 +1579,13 @@ class MusicBot(discord.Client):
         if entry and entry.from_auto_playlist:
             log.info("Auto playlist track could not be played:  %r", entry)
             guild = player.voice_client.guild
+            # ffmpeg failures are usually transient (expired stream URL, network),
+            # so drop the track for this session but keep it in the playlist file.
             await self.server_data[guild.id].autoplaylist.remove_track(
-                entry.info.input_subject, ex=ex, delete_from_ap=self.config.remove_ap
+                entry.info.input_subject,
+                ex=ex,
+                delete_from_ap=self.config.remove_ap
+                and not isinstance(ex, exceptions.FFmpegError),
             )
 
         # If the party isn't rockin', don't bother knockin on my door.

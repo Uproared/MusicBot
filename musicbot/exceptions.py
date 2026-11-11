@@ -64,13 +64,8 @@ class WrongEntryTypeError(ExtractionError):
     pass
 
 
-# FFmpeg complained about something
+# ffmpeg exited with an error during playback
 class FFmpegError(MusicbotException):
-    pass
-
-
-# FFmpeg complained about something but we don't care
-class FFmpegWarning(MusicbotException):
     pass
 
 

@@ -1,13 +1,24 @@
 import asyncio
-import io
 import json
 import logging
 import os
-import sys
-import time
+import re
+import subprocess
+from collections import deque
 from enum import Enum
 from threading import Thread
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import (
+    IO,
+    TYPE_CHECKING,
+    Any,
+    Deque,
+    Dict,
+    List,
+    Optional,
+    Type,
+    TypeVar,
+    Union,
+)
 
 from discord import (
     AudioSource,
@@ -20,22 +31,111 @@ from discord import (
 from .constants import MUSICBOT_VOICE_MAX_KBITRATE
 from .constructs import Serializable, Serializer, SkipState
 from .entry import LocalFilePlaylistEntry, StreamPlaylistEntry, URLPlaylistEntry
-from .exceptions import FFmpegError, FFmpegWarning
+from .exceptions import FFmpegError
 from .lib.event_emitter import EventEmitter
 
 if TYPE_CHECKING:
     from .bot import MusicBot
     from .playlist import Playlist
 
-    AsyncFuture = asyncio.Future[Any]
-else:
-    AsyncFuture = asyncio.Future
-
 # Type alias
 EntryTypes = Union[URLPlaylistEntry, StreamPlaylistEntry, LocalFilePlaylistEntry]
 FFmpegSources = Union[PCMVolumeTransformer[FFmpegPCMAudio], FFmpegOpusAudio]
+FFmpegAudioT = TypeVar("FFmpegAudioT", FFmpegOpusAudio, FFmpegPCMAudio)
 
 log = logging.getLogger(__name__)
+
+
+class FFmpegStderrReader:
+    """
+    Collect an ffmpeg process's stderr through a pipe MusicBot owns.
+
+    Each line is logged as it arrives and the last few are kept for the error
+    message. discord.py's own stderr handling isn't used: it hands data over
+    only in 8 KB blocks, so the final error line may arrive after playback has
+    already been reported as finished.
+    """
+
+    # Warnings ffmpeg prints for media that still plays. Logged at the FFMPEG
+    # level instead of WARNING.
+    KNOWN_NOISE = (
+        "Header missing",
+        "Estimating duration from birate, this may be inaccurate",
+        "Using AVStream.codec to pass codec parameters to muxers is deprecated, use AVStream.codecpar instead.",
+        "Application provided invalid, non monotonically increasing dts to muxer in stream",
+        "Last message repeated",
+        "Failed to send close message",
+        "decode_band_types: Input buffer exhausted before END element found",
+    )
+
+    def __init__(self, input_name: str) -> None:
+        """
+        :param: input_name:  The file or URL given to ffmpeg. It is shortened
+            in error messages so paths and stream URLs aren't posted to Discord.
+        """
+        self._input_name = input_name
+        self._tail: Deque[str] = deque(maxlen=8)
+        self._thread: Optional[Thread] = None
+
+    def create(
+        self, source_cls: Type[FFmpegAudioT], *args: Any, **kwargs: Any
+    ) -> FFmpegAudioT:
+        """
+        Create an ffmpeg audio source with its stderr sent to this reader.
+        """
+        read_fd, write_fd = os.pipe()
+        try:
+            # ffmpeg gets its own copy of the write end; ours must be closed so
+            # the reader sees end-of-file when ffmpeg exits.
+            with open(write_fd, "wb") as write_end:
+                source = source_cls(*args, stderr=write_end, **kwargs)
+        except BaseException:
+            os.close(read_fd)
+            raise
+
+        self._thread = Thread(
+            target=self._read_lines,
+            args=(open(read_fd, "rb"),),  # pylint: disable=consider-using-with
+            name="MB_FFmpegStdErrReader",
+            daemon=True,
+        )
+        self._thread.start()
+        return source
+
+    def _read_lines(self, read_end: IO[bytes]) -> None:
+        """Log ffmpeg's stderr line by line until ffmpeg exits."""
+        try:
+            with read_end:
+                for raw in read_end:
+                    line = raw.decode("utf8", errors="replace").strip()
+                    if not line:
+                        continue
+                    self._tail.append(line)
+                    if any(msg in line for msg in self.KNOWN_NOISE):
+                        log.ffmpeg("ffmpeg: %s", line)  # type: ignore[attr-defined]
+                    else:
+                        log.warning("ffmpeg: %s", line)
+        except (OSError, ValueError):
+            log.debug("Stopped reading ffmpeg stderr.", exc_info=True)
+
+    def wait_done(self, timeout: float) -> None:
+        """Wait for the reader to see ffmpeg's last output."""
+        if self._thread:
+            self._thread.join(timeout)
+
+    def summary(self) -> str:
+        """The last meaningful stderr line, safe to show in Discord."""
+        lines = [x for x in self._tail if not any(n in x for n in self.KNOWN_NOISE)]
+        if not lines:
+            lines = list(self._tail)
+        if not lines:
+            return ""
+        # URLs first: a stream input is a URL, and YouTube's include the server IP.
+        text = re.sub(r"https?://\S+", "<url>", lines[-1])
+        if self._input_name:
+            short = os.path.basename(self._input_name) or "<input>"
+            text = text.replace(self._input_name, short)
+        return text[:300]
 
 
 class MusicPlayerState(Enum):
@@ -57,12 +157,14 @@ class SourcePlaybackCounter(AudioSource):
         source: FFmpegSources,
         start_time: float = 0,
         playback_speed: float = 1.0,
+        stderr: Optional[FFmpegStderrReader] = None,
     ) -> None:
         """
         Manage playback source and attempt to count progress frames used
         to measure playback progress.
 
         :param: start_time:  A time in seconds that was used in ffmpeg -ss flag.
+        :param: stderr:  The reader collecting this source's ffmpeg stderr.
         """
         # NOTE: PCMVolumeTransformer will let you set any crazy value.
         # But internally it limits between 0 and 2.0.
@@ -71,6 +173,8 @@ class SourcePlaybackCounter(AudioSource):
         self._start_time: float = start_time
         self._playback_speed: float = playback_speed
         self._is_opus_audio: bool = isinstance(source, FFmpegOpusAudio)
+        self._stderr = stderr
+        self._error: Optional[Exception] = None
 
     def is_opus(self) -> bool:
         return self._is_opus_audio
@@ -79,7 +183,53 @@ class SourcePlaybackCounter(AudioSource):
         res = self._source.read()
         if res:
             self._num_reads += 1
+        elif self._error is None:
+            self._error = self._check_ffmpeg_exit()
         return res
+
+    @property
+    def _current_error(self) -> Optional[Exception]:
+        """
+        discord.py's AudioPlayer reads this when read() returns no data and
+        passes it to the `after` callback (MusicPlayer._playback_finished).
+        """
+        return self._error
+
+    def _check_ffmpeg_exit(self) -> Optional[Exception]:
+        """
+        Called when the source runs out of data: report a failed ffmpeg run.
+
+        discord.py 2.7.1 checks the exit code only at this same moment, before
+        ffmpeg has usually finished exiting, so failures looked like a normal
+        end of track. Wait briefly for the real exit code instead.
+        """
+        ffmpeg = self._source
+        if isinstance(ffmpeg, PCMVolumeTransformer):
+            ffmpeg = ffmpeg.original
+        proc = getattr(ffmpeg, "_process", None)
+        if not isinstance(proc, subprocess.Popen):
+            return None
+
+        try:
+            code = proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            log.warning("ffmpeg is still running after its output ended.")
+            return None
+        if code == 0:
+            return None
+
+        detail = ""
+        if self._stderr:
+            self._stderr.wait_done(timeout=2)
+            detail = self._stderr.summary()
+        if detail:
+            return FFmpegError(
+                "ffmpeg exited with code %(code)s:  %(detail)s",
+                fmt_args={"code": code, "detail": detail},
+            )
+        return FFmpegError(
+            "ffmpeg exited with code %(code)s.", fmt_args={"code": code}
+        )
 
     def cleanup(self) -> None:
         log.noise(  # type: ignore[attr-defined]
@@ -141,7 +291,6 @@ class MusicPlayer(EventEmitter, Serializable):
         self._play_lock = asyncio.Lock()
         self._current_player: Optional[VoiceClient] = None
         self._current_entry: Optional[EntryTypes] = None
-        self._stderr_future: Optional[AsyncFuture] = None
 
         self._source: Optional[SourcePlaybackCounter] = None
 
@@ -276,22 +425,21 @@ class MusicPlayer(EventEmitter, Serializable):
 
         :param: error:  An exception, if any, raised by playback.
         """
-        # Ensure the stderr stream reader for ffmpeg is exited.
-        if (
-            isinstance(self._stderr_future, asyncio.Future)
-            and not self._stderr_future.done()
-        ):
-            self._stderr_future.set_result(True)
-
         entry = self._current_entry
         if entry is None:
             log.debug("Playback finished, but _current_entry is None.")
             return
 
-        if self.repeatsong:
-            self.playlist.entries.appendleft(entry)
-        elif self.loopqueue:
-            self.playlist.entries.append(entry)
+        # Re-queue for repeat/loop, except when:
+        # - playback failed, so a broken track can't loop forever;
+        # - seek, speed or volume already put this entry back at the head
+        #   to restart it, which would otherwise queue it twice.
+        requeued = bool(self.playlist.entries) and self.playlist.entries[0] is entry
+        if not error and not requeued:
+            if self.repeatsong:
+                self.playlist.entries.appendleft(entry)
+            elif self.loopqueue:
+                self.playlist.entries.append(entry)
 
         # TODO: investigate if this is cruft code or not.
         if self._current_player:
@@ -303,29 +451,17 @@ class MusicPlayer(EventEmitter, Serializable):
         self._source = None
         self.stop()
 
-        # if an error was set, report it and return...
-        if error:
-            self.emit("error", player=self, entry=entry, ex=error)
-            return
-
-        # if a exception is found in the ffmpeg stderr stream, report it and return...
-        if (
-            isinstance(self._stderr_future, asyncio.Future)
-            and self._stderr_future.done()
-            and self._stderr_future.exception()
-        ):
-            # I'm not sure that this would ever not be done if it gets to this point
-            # unless ffmpeg is doing something highly questionable
-            self.emit(
-                "error", player=self, entry=entry, ex=self._stderr_future.exception()
-            )
-            return
-
-        # ensure file cleanup is handled if nothing was wrong with playback.
+        # Delete the media file if not keeping them, whether or not playback
+        # worked. It is kept while the same file is still queued.
         if not self.bot.config.save_videos and entry:
             self.bot.create_task(
                 self._handle_file_cleanup(entry), name="MB_CacheCleanup"
             )
+
+        # if an error was set, report it and return...
+        if error:
+            self.emit("error", player=self, entry=entry, ex=error)
+            return
 
         # finally, tell the rest of MusicBot that playback is done.
         self.emit("finished-playing", player=self, entry=entry)
@@ -430,7 +566,7 @@ class MusicPlayer(EventEmitter, Serializable):
                     entry.set_audio_filter("volume", f"{self.volume:.2f}")
                     aoptions += f" {entry.get_audio_filters()}"
 
-                stderr_io = io.BytesIO()
+                stderr_reader = FFmpegStderrReader(entry.filename)
 
                 if self.bot.config.use_opus_probe or self.bot.config.use_opus_audio:
                     # Note: ffmpeg filters require encoding to work.
@@ -457,21 +593,21 @@ class MusicPlayer(EventEmitter, Serializable):
                     vc_kbitrate = self.voice_client.channel.bitrate / 1000
                     kbitrate = min(vc_kbitrate, entry.probed_bitrate)
                     kbitrate = min(kbitrate, MUSICBOT_VOICE_MAX_KBITRATE)
-                    source: FFmpegSources = FFmpegOpusAudio(
+                    source: FFmpegSources = stderr_reader.create(
+                        FFmpegOpusAudio,
                         entry.filename,
                         codec=entry.probed_codec,
                         bitrate=kbitrate,
                         before_options=boptions,
                         options=aoptions,
-                        stderr=stderr_io,
                     )
                 else:
                     source = PCMVolumeTransformer(
-                        FFmpegPCMAudio(
+                        stderr_reader.create(
+                            FFmpegPCMAudio,
                             entry.filename,
                             before_options=boptions,
                             options=aoptions,
-                            stderr=stderr_io,
                         ),
                         self.volume,
                     )
@@ -480,6 +616,7 @@ class MusicPlayer(EventEmitter, Serializable):
                     source,
                     start_time=entry.start_time,
                     playback_speed=entry.playback_speed,
+                    stderr=stderr_reader,
                 )
                 log.ffmpeg(  # type: ignore[attr-defined]
                     "Creating player with options: ffmpeg %(before)s -i %(input)s %(after)s",
@@ -496,16 +633,6 @@ class MusicPlayer(EventEmitter, Serializable):
                 # I need to add ytdl hooks
                 self.state = MusicPlayerState.PLAYING
                 self._current_entry = entry
-
-                self._stderr_future = asyncio.Future()
-
-                stderr_thread = Thread(
-                    target=filter_stderr,
-                    args=(stderr_io, self._stderr_future),
-                    name="MB_FFmpegStdErrReader",
-                )
-
-                stderr_thread.start()
 
                 self.emit("play", player=self, entry=entry)
 
@@ -666,96 +793,6 @@ class MusicPlayer(EventEmitter, Serializable):
         if self._source:
             return self._source.session_progress
         return 0
-
-
-# TODO: I need to add a check if the event loop is closed?
-
-
-def filter_stderr(stderr: io.BytesIO, future: AsyncFuture) -> None:
-    """
-    Consume a `stderr` bytes stream and check it for errors or warnings.
-    Set the given `future` with either an error found in the stream or
-    set the future with a successful result.
-    """
-    last_ex = None
-    while not future.done():
-        data = stderr.readline()
-        if data:
-            log.ffmpeg(  # type: ignore[attr-defined]
-                "Data from ffmpeg: %s",
-                repr(data),
-            )
-            try:
-                if check_stderr(data):
-                    sys.stderr.buffer.write(data)
-                    sys.stderr.buffer.flush()
-
-            except FFmpegError as e:
-                log.ffmpeg(  # type: ignore[attr-defined]
-                    "Error from ffmpeg: %s", str(e).strip()
-                )
-                last_ex = e
-                if not future.done():
-                    future.set_exception(e)
-
-            except FFmpegWarning as e:
-                log.ffmpeg(  # type: ignore[attr-defined]
-                    "Warning from ffmpeg:  %s", str(e).strip()
-                )
-        else:
-            time.sleep(0.5)
-
-    if not future.done():
-        if last_ex:
-            future.set_exception(last_ex)
-        else:
-            future.set_result(True)
-
-
-def check_stderr(data: bytes) -> bool:
-    """
-    Inspect `data` from a subprocess call's stderr output for specific
-    messages and raise them as a suitable exception.
-
-    :returns:  True if nothing was detected or nothing could be detected.
-
-    :raises: musicbot.exceptions.FFmpegWarning
-        If a warning level message was detected in the `data`
-    :raises: musicbot.exceptions.FFmpegError
-        If an error message was detected in the `data`
-    """
-    ddata = ""
-    try:
-        ddata = data.decode("utf8")
-    except UnicodeDecodeError:
-        log.ffmpeg(  # type: ignore[attr-defined]
-            "Unknown error decoding message from ffmpeg", exc_info=True
-        )
-        return True  # fuck it
-
-    log.ffmpeg("Decoded data from ffmpeg: %s", ddata)  # type: ignore[attr-defined]
-
-    # TODO: Regex
-    warnings = [
-        "Header missing",
-        "Estimating duration from birate, this may be inaccurate",
-        "Using AVStream.codec to pass codec parameters to muxers is deprecated, use AVStream.codecpar instead.",
-        "Application provided invalid, non monotonically increasing dts to muxer in stream",
-        "Last message repeated",
-        "Failed to send close message",
-        "decode_band_types: Input buffer exhausted before END element found",
-    ]
-    errors = [
-        "Invalid data found when processing input",  # need to regex this properly, its both a warning and an error
-    ]
-
-    if any(msg in ddata for msg in warnings):
-        raise FFmpegWarning(ddata)
-
-    if any(msg in ddata for msg in errors):
-        raise FFmpegError(ddata)
-
-    return True
 
 
 # if redistributing ffmpeg is an issue, it can be downloaded from here:
