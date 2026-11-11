@@ -349,3 +349,47 @@ def test_leaveserver_unknown_name_is_a_clean_error(bot_cls):
             bot_cls.cmd_leaveserver(fake, ssd_=None, val="No", leftover_args=["such", "server"])
         )
     assert fake.left == [] and message
+
+
+# --- Video links that also name a playlist (the &list= prompt) -----------------
+
+ALBUM = "OLAK5uy_TestAlbumNotARealListId000000000"
+
+
+@pytest.mark.parametrize(
+    "url, expected",
+    [
+        # albums were missed: the old regex only knew list=PL...
+        (f"https://www.youtube.com/watch?v=abcdefghijk&list={ALBUM}", ("abcdefghijk", ALBUM)),
+        (f"https://music.youtube.com/watch?v=abcdefghijk&list={ALBUM}", ("abcdefghijk", ALBUM)),
+        # parameter order and extra parameters no longer matter
+        ("https://www.youtube.com/watch?list=PLabc123&v=abcdefghijk", ("abcdefghijk", "PLabc123")),
+        ("https://www.youtube.com/watch?v=abcdefghijk&pp=xyz&list=PLabc123", ("abcdefghijk", "PLabc123")),
+        # already worked
+        ("https://www.youtube.com/watch?v=abcdefghijk&list=PLabc123", ("abcdefghijk", "PLabc123")),
+        ("https://youtu.be/abcdefghijk?list=PLabc123", ("abcdefghijk", "PLabc123")),
+        # no prompt: mixes, plain videos, other sites
+        ("https://www.youtube.com/watch?v=abcdefghijk&list=RDabcdefghijk", None),
+        ("https://www.youtube.com/watch?v=abcdefghijk", None),
+        ("https://notyoutube.com/watch?v=abcdefghijk&list=PLabc123", None),
+    ],
+)
+def test_playlist_prompt_for_video_links(bot_cls, url, expected):
+    prompts = []
+
+    def create_task(coro):
+        args = coro.cr_frame.f_locals
+        prompts.append((args["ignore_vid"], args["next_url"]))
+        coro.close()
+
+    fake = SimpleNamespace(create_task=create_task)
+    asyncio.run(
+        bot_cls._cmd_play_compound_link(
+            fake, None, None, None, None, None, None, None, [], url, False
+        )
+    )
+    if expected is None:
+        assert prompts == []
+    else:
+        video_id, list_id = expected
+        assert prompts == [(video_id, f"https://www.youtube.com/playlist?list={list_id}")]
