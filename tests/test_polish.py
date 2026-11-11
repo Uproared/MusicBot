@@ -1116,3 +1116,63 @@ def test_playlist_prompt_confirms_what_was_added(bot_cls):
     replies, deleted, message = _prompt_run(bot_cls, play_result=card)
     assert replies == [card] and card.reply_to is message
     assert len(deleted) == 1
+
+
+# --- replaying the same song still gets a card ---------------------------------------
+
+
+def _replay_run(bot_cls, controls_msg):
+    sent = []
+
+    async def safe_send_message(dest, content):
+        sent.append(content)
+        return SimpleNamespace(id=99)
+
+    guild = SimpleNamespace(id=1)
+    author = SimpleNamespace(mention="<@7>", name="bob", id=7)
+    cur = _entry("Song A", author=author)
+    cur.from_auto_playlist = False
+    ssd = SimpleNamespace(
+        lang_code="", guild_id=1, last_np_channel=object(),
+        last_np_msg=SimpleNamespace(id=10),           # the previous card...
+        last_played_song_subject=cur.url,              # ...was for this same song
+        current_playing_url="", np_controls_msg=controls_msg, np_controls_entry=None,
+    )
+    fake = SimpleNamespace(
+        server_data={1: ssd},
+        config=SimpleNamespace(
+            write_current_song=False, enable_queue_history_global=False,
+            enable_queue_history_guilds=False, now_playing_mentions=False,
+            dm_nowplaying=False, no_nowplaying_auto=False, nowplaying_channels=set(),
+            bound_channels=set(), delete_nowplaying=True, embeds=True,
+            delete_delay_short=30,
+        ),
+        permissions=SimpleNamespace(for_user=lambda _u: SimpleNamespace(skip_when_absent=False)),
+        _handle_guild_auto_pause=_noop, reset_player_inactivity=_noop,
+        update_now_playing_status=_noop, serialize_queue=_noop,
+        safe_send_message=safe_send_message,
+        _retire_np_controls=lambda g, edit=True: _noop(),
+        _track_np_controls=lambda *a: None,
+    )
+    fake._np_card = lambda *a, **k: bot_cls._np_card(fake, *a, **k)
+    player = _player(cur)
+    player.voice_client = SimpleNamespace(
+        channel=SimpleNamespace(guild=guild, members=[author], name="General"), guild=guild
+    )
+    player.skip_state = SimpleNamespace(reset=lambda: None)
+    asyncio.run(bot_cls.on_player_play(fake, player=player, entry=cur))
+    return sent, ssd, cur
+
+
+def test_replayed_song_gets_a_card_when_the_old_one_is_gone(bot_cls):
+    # DeleteNowPlaying deleted the previous card when the song ended.
+    sent, _ssd, _cur = _replay_run(bot_cls, controls_msg=None)
+    assert len(sent) == 1 and sent[0].title == "Song A"
+
+
+def test_reconnect_keeps_the_existing_card(bot_cls):
+    # The same song restarting while its card is still up (e.g. a voice
+    # reconnect): no second card, and the old card's bar follows the restart.
+    sent, ssd, cur = _replay_run(bot_cls, controls_msg=SimpleNamespace(id=10))
+    assert sent == []
+    assert ssd.np_controls_entry is cur
