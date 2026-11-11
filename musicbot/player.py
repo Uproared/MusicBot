@@ -6,10 +6,11 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import time
 from collections import deque
 from enum import Enum
-from threading import Thread
+from threading import Thread, get_native_id
 from typing import (
     IO,
     TYPE_CHECKING,
@@ -179,6 +180,69 @@ def _time_gc(phase: str, _info: Dict[str, Any]) -> None:
 
 gc.callbacks.append(_time_gc)
 
+# Audio thread priority. At normal priority the OS sometimes runs another
+# program when the audio thread should wake up, which delays a packet by
+# 40-60 ms, enough to hear. Measured on Windows (3 min each): normal priority
+# gave worst gaps of 63-77 ms; this thread at "Highest" gave 31 ms, none
+# over 40 ms. The thread sleeps between packets and does little each time,
+# so a higher priority can't starve other programs.
+AUDIO_THREAD_NICE = -5  # Linux; allowed by CAP_SYS_NICE or LimitNICE=-5
+_WINDOWS_THREAD_PRIORITY_HIGHEST = 2
+_priority_refused_logged = False
+_kernel32: Any = None
+
+
+def _windows_kernel32() -> Any:
+    """kernel32 with the prototypes we need (own instance, not ctypes.windll)."""
+    global _kernel32  # pylint: disable=global-statement
+    if _kernel32 is None:
+        import ctypes  # pylint: disable=import-outside-toplevel
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        k32.GetCurrentThread.restype = ctypes.c_void_p
+        k32.SetThreadPriority.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        k32.SetThreadPriority.restype = ctypes.c_int
+        k32.GetThreadPriority.argtypes = [ctypes.c_void_p]
+        k32.GetThreadPriority.restype = ctypes.c_int
+        _kernel32 = k32
+    return _kernel32
+
+
+def _raise_audio_thread_priority() -> None:
+    """
+    Raise the calling thread's priority; called on the audio thread. Best
+    effort: if the OS refuses, log that once and carry on as before.
+    """
+    global _priority_refused_logged  # pylint: disable=global-statement
+    try:
+        if sys.platform == "win32":
+            k32 = _windows_kernel32()
+            if not k32.SetThreadPriority(
+                k32.GetCurrentThread(), _WINDOWS_THREAD_PRIORITY_HIGHEST
+            ):
+                import ctypes  # pylint: disable=import-outside-toplevel
+
+                raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
+        elif sys.platform.startswith("linux"):
+            # On Linux, setpriority() on a thread ID sets that thread's nice
+            # value. Never lower a priority that is already higher (Nice=).
+            tid = get_native_id()
+            if os.getpriority(os.PRIO_PROCESS, tid) > AUDIO_THREAD_NICE:
+                os.setpriority(os.PRIO_PROCESS, tid, AUDIO_THREAD_NICE)
+        else:
+            return
+        log.debug("Raised the audio thread's priority.")
+    except OSError as e:
+        if not _priority_refused_logged:
+            _priority_refused_logged = True
+            log.info(
+                "Could not raise the audio thread's priority (%s). Audio may "
+                "stutter slightly when the machine is busy. On Linux, adding "
+                "LimitNICE=%d under [Service] in the systemd unit allows it.",
+                e,
+                AUDIO_THREAD_NICE,
+            )
+
 
 class SourcePlaybackCounter(AudioSource):
     def __init__(
@@ -213,11 +277,16 @@ class SourcePlaybackCounter(AudioSource):
         self._late_worst: float = 0.0
         self._late_logged_at: float = float("-inf")
         self._late_summary_done: bool = False
+        self._priority_raised: bool = False
 
     def is_opus(self) -> bool:
         return self._is_opus_audio
 
     def read(self) -> bytes:
+        if not self._priority_raised:
+            # The first read runs on this track's (new) audio thread.
+            self._priority_raised = True
+            _raise_audio_thread_priority()
         started = time.perf_counter()
         res = self._source.read()
         if res:
