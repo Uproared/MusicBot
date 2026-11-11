@@ -8159,15 +8159,16 @@ class MusicBot(discord.Client):
         # fmt: off
         usage=[
             "{cmd}\n"
-            + _Dd("    Update the cookies.txt file using a cookies.txt attachment."),
+            + _Dd("    Update the cookies.txt file using a cookies.txt attachment, sent in a DM to the bot."),
 
             "{cmd} [off | on]\n"
-            + _Dd("    Enable or disable cookies.txt file without deleting it."),
+            + _Dd("    Enable or disable cookies.txt file without deleting it. `on` also reloads the file."),
         ],
         # fmt: on
         desc=_Dd(
             "Allows management of the cookies feature in yt-dlp.\n"
             "When updating cookies, you must upload a file named cookies.txt\n"
+            "Uploads are only accepted in a direct message to the bot.\n"
             "If cookies are disabled, uploading will enable the feature.\n"
             "Uploads will delete existing cookies, including disabled cookies file.\n"
             "\n"
@@ -8177,6 +8178,7 @@ class MusicBot(discord.Client):
             "  It is not recommended due to these risks, and you should not use this\n"
             "  feature if you do not understand how to avoid the risks."
         ),
+        allow_dm=True,
     )
     async def cmd_setcookies(
         self, ssd_: Optional[GuildSpecificData], message: discord.Message, opt: str = ""
@@ -8186,9 +8188,6 @@ class MusicBot(discord.Client):
         """
         opt = opt.lower()
         if opt == "on":
-            if self.downloader.cookies_enabled:
-                raise exceptions.CommandError("Cookies already enabled.")
-
             if (
                 not self.config.disabled_cookies_path.is_file()
                 and not self.config.cookies_path.is_file()
@@ -8199,9 +8198,18 @@ class MusicBot(discord.Client):
 
             # check for cookies file and use it.
             if self.config.cookies_path.is_file():
+                # B7: this now rereads the file, so when cookies are already
+                # on it loads a cookies.txt copied over the old one.
+                self._check_cookies_file(self.config.cookies_path)
+                reloaded = self.downloader.cookies_enabled
                 self.downloader.enable_ytdl_cookies()
+                if reloaded:
+                    return Response(
+                        _D("Cookies have been reloaded from the cookies file.", ssd_)
+                    )
             else:
                 # or rename the file as needed.
+                self._check_cookies_file(self.config.disabled_cookies_path)
                 try:
                     self.config.disabled_cookies_path.rename(self.config.cookies_path)
                     self.downloader.enable_ytdl_cookies()
@@ -8233,20 +8241,34 @@ class MusicBot(discord.Client):
                 "No attached uploads were found, try again while uploading a cookie file."
             )
 
-        # check for a disabled cookies file and remove it.
-        if self.config.disabled_cookies_path.is_file():
-            try:
-                self.config.disabled_cookies_path.unlink()
-            except OSError as e:
-                log.warning(
-                    "Could not remove old, disabled cookies file:  %(raw_error)s",
-                    {"raw_error": e},
-                )
+        # SEC3: in a server channel, everyone who can see the channel can
+        # download the file. Only take uploads in a DM to the bot.
+        if not isinstance(message.channel, discord.abc.PrivateChannel):
+            await self.safe_delete_message(message)
+            raise exceptions.CommandError(
+                "For safety, cookies are only accepted in a direct message to the bot. "
+                "This file was not used, and the bot tried to delete your message. "
+                "Anyone who could see it may have copied the cookies, so consider "
+                "signing out of that account to end the session."
+            )
 
-        # simply save the uploaded file in attachment 1 as cookies.txt.
+        # Save under a temporary name and check it first, so a bad upload
+        # can't replace working cookies (it now takes effect at once, B7).
+        upload_path = self.config.cookies_path.with_name(
+            f"{self.config.cookies_path.name}.upload"
+        )
         try:
-            await message.attachments[0].save(self.config.cookies_path)
+            upload_path.unlink(missing_ok=True)
+            # 0o600: only the bot's user can read it (SEC3). Ignored on Windows.
+            fd = os.open(
+                upload_path,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0),
+                0o600,
+            )
+            with open(fd, "wb") as fp:
+                await message.attachments[0].save(fp)
         except discord.HTTPException as e:
+            upload_path.unlink(missing_ok=True)
             raise exceptions.CommandError(
                 "Error downloading the cookies file from discord:  %(raw_error)s",
                 fmt_args={"raw_error": e},
@@ -8257,11 +8279,54 @@ class MusicBot(discord.Client):
                 fmt_args={"raw_error": e},
             ) from e
 
-        # enable cookies if it is not already.
-        if not self.downloader.cookies_enabled:
-            self.downloader.enable_ytdl_cookies()
+        try:
+            self._check_cookies_file(upload_path)
+        except exceptions.CommandError:
+            upload_path.unlink(missing_ok=True)
+            raise
+
+        # check for a disabled cookies file and remove it.
+        if self.config.disabled_cookies_path.is_file():
+            try:
+                self.config.disabled_cookies_path.unlink()
+            except OSError as e:
+                log.warning(
+                    "Could not remove old, disabled cookies file:  %(raw_error)s",
+                    {"raw_error": e},
+                )
+
+        try:
+            os.replace(upload_path, self.config.cookies_path)
+        except OSError as e:
+            raise exceptions.CommandError(
+                "Could not save cookies to disk:  %(raw_error)s",
+                fmt_args={"raw_error": e},
+            ) from e
+
+        # B7: (re)load the file, also when cookies were already on.
+        self.downloader.enable_ytdl_cookies()
 
         return Response(_D("Cookies uploaded and enabled.", ssd_))
+
+    def _check_cookies_file(self, path: pathlib.Path) -> None:
+        """
+        Raise CommandError unless yt-dlp can read cookies from `path`.
+        Cookie changes now take effect at once (B7), so a bad file would
+        otherwise break every extraction straight away.
+        """
+        try:
+            count = self.downloader.count_cookies_in_file(path)
+        except (OSError, ValueError) as e:
+            raise exceptions.CommandError(
+                "That isn't a cookies.txt file yt-dlp can use. It must be in "
+                "Netscape format, starting with the line:  # Netscape HTTP Cookie File\n"
+                "The cookies in use were not changed."
+            ) from e
+        if not count:
+            raise exceptions.CommandError(
+                "That cookies.txt file has no cookies in it. "
+                "The cookies in use were not changed."
+            )
 
     async def on_message(self, message: discord.Message) -> None:
         """

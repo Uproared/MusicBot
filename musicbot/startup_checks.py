@@ -95,6 +95,24 @@ def check_private_files(files: Iterable[Tuple[str, pathlib.Path]]) -> None:
             log.debug("Could not check permissions of %s", path, exc_info=True)
 
 
+def check_deno_path(deno_path: str) -> None:
+    """Error if YtdlpDenoPath is set but there's no deno there (C4)."""
+    if not deno_path:
+        return
+    path = pathlib.Path(os.path.expanduser(deno_path))
+    # yt-dlp runs <folder>/deno for a folder; Windows adds .exe by itself.
+    exe = path.joinpath("deno") if path.is_dir() else path
+    candidates = [exe]
+    if sys.platform == "win32":
+        candidates.append(pathlib.Path(f"{exe}.exe"))
+    if not any(c.is_file() for c in candidates):
+        log.error(
+            "YtdlpDenoPath is set to %s, but there is no deno program there. "
+            "YouTube playback may fail. Fix the path, or leave it blank to use PATH.",
+            path,
+        )
+
+
 def run_startup_checks(config: "Config") -> None:
     """Run all startup checks. Only logs."""
     log_versions()
@@ -105,3 +123,4 @@ def run_startup_checks(config: "Config") -> None:
             ("options (has the bot token)", config.config_file),
         ]
     )
+    check_deno_path(config.ytdlp_deno_path)

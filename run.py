@@ -512,6 +512,7 @@ def req_ensure_env() -> None:
             "Install deno from:  https://github.com/denoland/deno/\n"
             " -OR-\n"
             "Install node (version 25 or newer) via your package manager.\n"
+            "(Ignore this if YtdlpDenoPath in options.ini points to deno.)\n"
         )
 
 

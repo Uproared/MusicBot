@@ -953,7 +953,19 @@ class Config:
                 "For examples of what you might put here, check the following two links:\n"
                 "   https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/User-Agent \n"
                 "   https://www.useragents.me/ \n"
-                "Leave blank to use default, dynamically generated UA strings."
+                "Leave blank to use a random browser UA string, picked once at startup."
+            ),
+        )
+        self.ytdlp_deno_path: str = self.register.init_option(
+            section="MusicBot",
+            option="YtdlpDenoPath",
+            dest="ytdlp_deno_path",
+            default=ConfigDefaults.ytdlp_deno_path,
+            getter="getstr",
+            comment=_Dd(
+                "Path to the deno program, or the folder that holds it, for yt-dlp.\n"
+                "YouTube needs deno (or node) to solve its JavaScript challenges.\n"
+                "Leave blank to find deno or node on PATH (and ~/.deno/bin for deno)."
             ),
         )
         self.ytdlp_source_address: str = self.register.init_option(
@@ -1579,6 +1591,7 @@ class ConfigDefaults:
     auto_unpause_on_play: bool = False
     ytdlp_proxy: str = ""
     ytdlp_user_agent: str = ""
+    ytdlp_deno_path: str = ""
     ytdlp_source_address: str = "*"
     ytdlp_concurrent_frags: int = 1
     downloader_threads_max: int = 2

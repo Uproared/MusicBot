@@ -6,14 +6,16 @@ import hashlib
 import logging
 import os
 import pathlib
+import threading
 from collections import UserDict
 from concurrent.futures import ThreadPoolExecutor
 from pprint import pformat
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import aiohttp
 import yt_dlp as youtube_dl  # type: ignore[import-untyped]
+from yt_dlp.cookies import YoutubeDLCookieJar  # type: ignore[import-untyped]
 from yt_dlp.networking.exceptions import (  # type: ignore[import-untyped]
     NoSupportingHandlers,
 )
@@ -73,7 +75,8 @@ ytdl_format_options_immutable = MappingProxyType(
         "outtmpl": "%(extractor)s-%(id)s-%(title).64B-%(qhash)s.%(ext)s",
         "restrictfilenames": True,
         "noplaylist": True,
-        "nocheckcertificate": True,
+        # SEC2: "nocheckcertificate" (TLS checks off, cookies included) and
+        # "usenetrc" (reads ~/.netrc) were removed. Neither is needed here.
         "ignoreerrors": False,
         "logtostderr": False,
         "quiet": True,
@@ -82,7 +85,6 @@ ytdl_format_options_immutable = MappingProxyType(
         "extract_flat": "in_playlist",
         "default_search": "auto",
         "source_address": None,
-        "usenetrc": True,
         # yt-dlp's current form of no_color. The old key made every YoutubeDL
         # instance after the first warn "Overwriting params from color".
         "color": "no_color",
@@ -135,7 +137,9 @@ class Downloader:
         ]
 
         # force ytdlp and HEAD requests to use the same UA string.
-        # If the constant is set, use that, otherwise use dynamic selection.
+        # If the constant is set, use that, otherwise pick one random UA for
+        # this process. It no longer changes per request: that code was inverted
+        # (it replaced a configured UA), and a stable UA suits cookies (B12).
         if bot.config.ytdlp_user_agent:
             ua = bot.config.ytdlp_user_agent
             log.warning("Forcing YTDLP to use User Agent:  %s", ua)
@@ -153,6 +157,12 @@ class Downloader:
             "deno": {},
             "node": {},
         }
+        # C4: YtdlpDenoPath points yt-dlp at a deno binary (or its folder)
+        # that isn't on PATH.
+        if bot.config.ytdlp_deno_path:
+            ytdl_format_options["js_runtimes"]["deno"] = {
+                "path": os.path.expanduser(bot.config.ytdlp_deno_path)
+            }
 
         # add concurrent-fragments option if it is needed.
         if bot.config.ytdlp_concurrent_frags > 1:
@@ -183,12 +193,12 @@ class Downloader:
             ytdl_format_options["verbose"] = True
 
         # check if we should apply a cookies file to ytdlp.
-        if bot.config.cookies_path.is_file():
+        use_cookies = bot.config.cookies_path.is_file()
+        if use_cookies:
             log.info(
                 "MusicBot will use cookies for yt-dlp from:  %s",
                 bot.config.cookies_path,
             )
-            ytdl_format_options["cookiefile"] = bot.config.cookies_path
 
         if bot.config.ytdlp_proxy:
             log.info("Yt-dlp will use your configured proxy server.")
@@ -201,52 +211,101 @@ class Downloader:
                 self.download_folder, str(otmpl)
             )
 
-        self.unsafe_ytdl = youtube_dl.YoutubeDL(ytdl_format_options)
-        self.safe_ytdl = youtube_dl.YoutubeDL(
-            {**ytdl_format_options, "ignoreerrors": True}
-        )
+        # YoutubeDL instances are made per download thread from these options
+        # (B9: two threads shared one instance), and remade after a cookie
+        # change (B7: yt-dlp reads the cookie file once, on first use, so
+        # changing params["cookiefile"] afterwards did nothing).
+        self._ytdl_options: Dict[str, Any] = ytdl_format_options
+        self._ytdl_local = threading.local()
+        # (generation, cookies on), replaced as one tuple so a thread never
+        # sees a new generation with the old cookie setting.
+        self._ytdl_state: Tuple[int, bool] = (0, use_cookies)
+        # Only for prepare_filename() on the event loop; never makes requests.
+        self._filename_ytdl = youtube_dl.YoutubeDL(self._ytdl_params(False))
+
+    def _ytdl_params(self, cookies: bool, **overrides: Any) -> Dict[str, Any]:
+        """A fresh options dict: YoutubeDL keeps and edits the one it's given."""
+        params = {
+            k: dict(v) if isinstance(v, dict) else v
+            for k, v in self._ytdl_options.items()
+        }
+        if cookies:
+            # str: on Windows with HOME set, yt-dlp calls .startswith on it.
+            params["cookiefile"] = str(self.bot.config.cookies_path)
+        params.update(overrides)
+        return params
+
+    def _thread_ytdl(self, safe: bool) -> youtube_dl.YoutubeDL:
+        """
+        The calling thread's YoutubeDL instance: the safe one ignores errors.
+        Made on first use in each thread, and again after a cookie change.
+        """
+        local = self._ytdl_local
+        state = self._ytdl_state
+        if getattr(local, "state", None) != state:
+            # Old instances are dropped, not closed: close() writes their
+            # in-memory cookies back to the cookie file, which would undo a
+            # cookies.txt that was just replaced. A call still running on an
+            # old instance finishes on it.
+            local.instances = {}
+            local.state = state
+        if safe not in local.instances:
+            overrides = {"ignoreerrors": True} if safe else {}
+            local.instances[safe] = youtube_dl.YoutubeDL(
+                self._ytdl_params(state[1], **overrides)
+            )
+        return local.instances[safe]
 
     @property
-    def ytdl(self) -> youtube_dl.YoutubeDL:
-        """Get the Safe (errors ignored) instance of YoutubeDL."""
-        return self.safe_ytdl
+    def unsafe_ytdl(self) -> youtube_dl.YoutubeDL:
+        """This thread's YoutubeDL instance that raises errors."""
+        return self._thread_ytdl(safe=False)
+
+    @property
+    def safe_ytdl(self) -> youtube_dl.YoutubeDL:
+        """This thread's YoutubeDL instance with errors ignored."""
+        return self._thread_ytdl(safe=True)
+
+    def _extract_in_thread(self, safe: bool, *args: Any, **kwargs: Any) -> Any:
+        """Runs in a download thread: extract_info on that thread's instance."""
+        return self._thread_ytdl(safe).extract_info(*args, **kwargs)
 
     @property
     def cookies_enabled(self) -> bool:
         """
-        Get status of cookiefile option in ytdlp objects.
+        Get status of the cookies file use in yt-dlp.
         """
-        return all(
-            "cookiefile" in ytdl.params for ytdl in [self.safe_ytdl, self.unsafe_ytdl]
-        )
+        return self._ytdl_state[1]
+
+    def _set_ytdl_cookies(self, enabled: bool) -> None:
+        """New YoutubeDL instances on each thread's next call, with or without cookies."""
+        generation = self._ytdl_state[0] + 1
+        self._ytdl_state = (generation, enabled)
 
     def enable_ytdl_cookies(self) -> None:
         """
-        Set the cookiefile option on the ytdl objects.
+        Use the cookies file, (re)reading it, even if cookies were already on.
         """
-        self.safe_ytdl.params["cookiefile"] = self.bot.config.cookies_path
-        self.unsafe_ytdl.params["cookiefile"] = self.bot.config.cookies_path
+        self._set_ytdl_cookies(True)
+        log.info("yt-dlp cookies (re)loaded from:  %s", self.bot.config.cookies_path)
 
     def disable_ytdl_cookies(self) -> None:
         """
-        Remove the cookiefile option on the ytdl objects.
+        Stop sending cookies.
         """
-        del self.safe_ytdl.params["cookiefile"]
-        del self.unsafe_ytdl.params["cookiefile"]
+        self._set_ytdl_cookies(False)
+        log.info("yt-dlp cookies disabled.")
 
-    def randomize_user_agent_string(self) -> None:
+    @staticmethod
+    def count_cookies_in_file(path: pathlib.Path) -> int:
         """
-        Uses ytdlp utils functions to re-randomize UA strings in YoutubeDL
-        objects and header check requests.
+        Read a cookies.txt with yt-dlp's own parser and count the cookies.
+        Raises OSError (http.cookiejar.LoadError included) or ValueError if
+        yt-dlp couldn't use it.
         """
-        # ignore this call if static UA is configured.
-        if not self.bot.config.ytdlp_user_agent:
-            return
-
-        new_ua = youtube_dl.utils.networking.random_user_agent()
-        self.unsafe_ytdl.params["http_headers"]["User-Agent"] = new_ua
-        self.safe_ytdl.params["http_headers"]["User-Agent"] = new_ua
-        self.http_req_headers["User-Agent"] = new_ua
+        jar = YoutubeDLCookieJar(path)
+        jar.load()
+        return len(jar)
 
     def get_url_or_none(self, url: str) -> Optional[str]:
         """
@@ -442,10 +501,7 @@ class Downloader:
         # if we made it here, put our request data into the extraction.
         data["__input_subject"] = song_subject
         data["__header_data"] = headers or None
-        data["__expected_filename"] = self.ytdl.prepare_filename(data)
-
-        # ensure the UA is randomized with each new request if not set static.
-        self.randomize_user_agent_string()
+        data["__expected_filename"] = self._filename_ytdl.prepare_filename(data)
 
         """
         # disabled since it is only needed for working on extractions.
@@ -532,12 +588,22 @@ class Downloader:
                 elif data["_type"] == "playlist":
                     return data
 
+        # B14: YouTube's top search hit can be a channel, and a one-result
+        # search ("ytsearch:") then queued the whole channel as one track.
+        # Ask for a few results (from the same results page) and keep the
+        # first video, below.
+        single_yt_search = song_subject.startswith("ytsearch:") and kwargs.get(
+            "process", True
+        )
+        if single_yt_search:
+            song_subject = "ytsearch5:" + song_subject[len("ytsearch:") :]
+
         # Actually call YoutubeDL extract_info.
         try:
             data = await self.bot.loop.run_in_executor(
                 self.thread_pool,
                 functools.partial(
-                    self.unsafe_ytdl.extract_info, song_subject, *args, **kwargs
+                    self._extract_in_thread, False, song_subject, *args, **kwargs
                 ),
             )
         except DownloadError as e:
@@ -578,12 +644,26 @@ class Downloader:
             data = await self.bot.loop.run_in_executor(
                 self.thread_pool,
                 functools.partial(
-                    self.unsafe_ytdl.extract_info, song_subject, *args, **kwargs
+                    self._extract_in_thread, False, song_subject, *args, **kwargs
                 ),
             )
 
         # make sure the ytdlp data is serializable to make it more predictable.
-        data = self.ytdl.sanitize_info(data)
+        data = youtube_dl.YoutubeDL.sanitize_info(data)
+
+        # B14: keep one result, the first video (ie_key "Youtube"; channels
+        # and playlists are "YoutubeTab"), so the single-result handling
+        # below applies as before.
+        if single_yt_search and isinstance(data.get("entries"), list):
+            results = data["entries"]
+            videos = [e for e in results if e and e.get("ie_key") == "Youtube"]
+            if results and videos and videos[0] is not results[0]:
+                log.info(
+                    "Top search result is not a video (%(url)s), using the first video:  %(title)s",
+                    {"url": results[0].get("url"), "title": videos[0].get("title")},
+                )
+            data["entries"] = videos[:1] or results[:1]
+            data["playlist_count"] = len(data["entries"])
 
         # Extractor youtube:search returns a playlist-like result, usually with one entry
         # when searching via a play command.
@@ -619,7 +699,7 @@ class Downloader:
         )
         return await self.bot.loop.run_in_executor(
             self.thread_pool,
-            functools.partial(self.safe_ytdl.extract_info, *args, **kwargs),
+            functools.partial(self._extract_in_thread, True, *args, **kwargs),
         )
 
     def _return_local_media(self, song_subject: str) -> "YtdlpResponseDict":
