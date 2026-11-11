@@ -458,7 +458,7 @@ class MusicPlayer(EventEmitter, Serializable):
 
         entry = self._current_entry
         if entry is None:
-            log.debug("Playback finished, but _current_entry is None.")
+            log.warning("Playback finished, but _current_entry is None.")
             return
 
         stop_requested = self._stop_requested
@@ -886,6 +886,11 @@ class MusicPlayer(EventEmitter, Serializable):
     def is_dead(self) -> bool:
         """Test if MusicPlayer is in a dead state"""
         return self.state == MusicPlayerState.DEAD
+
+    @property
+    def is_starting(self) -> bool:
+        """Test if MusicPlayer is busy starting the next entry (downloading it, etc)."""
+        return self._play_lock.locked()
 
     @property
     def progress(self) -> float:

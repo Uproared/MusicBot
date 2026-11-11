@@ -13,7 +13,6 @@ import socket
 import ssl
 import sys
 import time
-import traceback
 import uuid
 from collections import defaultdict
 from io import BytesIO, StringIO
@@ -74,6 +73,7 @@ from .permissions import PermissionGroup, Permissions, PermissionsDefaults
 from .player import MusicPlayer
 from .playlist import Playlist
 from .spotify import Spotify
+from .startup_checks import run_startup_checks
 from .utils import (
     _func_,
     check_extractor,
@@ -202,6 +202,8 @@ class MusicBot(discord.Client):
             self.config = Config(self._config_file)
         except exceptions.RetryConfigException:
             self.config = Config(self._config_file)
+
+        run_startup_checks(self.config)
 
         self.permissions = Permissions(self._perms_file)
         # Set the owner ID in case it wasn't auto...
@@ -338,6 +340,49 @@ class MusicBot(discord.Client):
         # this creates an output similar to a progress indicator.
         muffle_discord_console_log()
         self.create_task(self._test_network(), name="MB_PingTest")
+        self.create_task(self._player_watchdog(), name="MB_PlayerWatchdog")
+
+    async def _player_watchdog(self) -> None:
+        """
+        Every 30 s, restart players that have stalled (S6). See
+        _restart_stalled_players() for what counts as stalled.
+        """
+        suspects: Set[int] = set()
+        while not self.logout_called:
+            await asyncio.sleep(30)
+            try:
+                suspects = self._restart_stalled_players(suspects)
+            except Exception:  # pylint: disable=broad-exception-caught
+                log.exception("Player watchdog check failed.")
+
+    def _restart_stalled_players(self, suspects: Set[int]) -> Set[int]:
+        """
+        Restart players that look stalled now and also did at the last check.
+        Stalled means: stopped, songs queued, voice connected, and not starting
+        a song. Nothing leaves a player like that on purpose; it happens when
+        a bug drops the next song (like B3 did) or a track ends while voice is
+        down. Requiring two checks in a row avoids racing the normal gap
+        between songs.
+
+        :returns: The guild IDs that look stalled now, for the next check.
+        """
+        stalled: Set[int] = set()
+        for guild_id, player in list(self.players.items()):
+            if (
+                player.is_stopped
+                and player.playlist.entries
+                and not player.is_starting
+                and not player.guild_or_net_unavailable
+                and player.voice_client.is_connected()
+            ):
+                stalled.add(guild_id)
+                if guild_id in suspects:
+                    log.warning(
+                        "Player in guild %(guild)s was stopped with %(count)s queued, restarting playback.",
+                        {"guild": guild_id, "count": len(player.playlist.entries)},
+                    )
+                    player.play()
+        return stalled
 
     async def _test_network(self) -> None:
         """
@@ -1315,8 +1360,10 @@ class MusicBot(discord.Client):
         self.server_data[guild.id].current_playing_url = ""
 
         if not player.voice_client.is_connected():
-            log.debug(
-                "VoiceClient says it is not connected, nothing else we can do here."
+            # A stall: the queue waits until voice is back (the watchdog or the
+            # voice-drop resume restarts it). Visible at WARNING (S6).
+            log.warning(
+                "Track finished while voice is not connected; the queue waits for voice."
             )
             return
 
@@ -1586,7 +1633,12 @@ class MusicBot(discord.Client):
             if isinstance(ex, exceptions.MusicbotException):
                 error = _D(ex.message, ssd) % ex.fmt_args
             else:
-                error = str(ex)
+                # Not one of MusicBot's own messages: str(ex) can hold file paths
+                # (e.g. FileNotFoundError), so keep the details in the log (S4).
+                error = _D(
+                    "An unexpected error occurred (%(error)s). Details are in the bot's log.",
+                    ssd,
+                ) % {"error": type(ex).__name__}
             res = ErrorResponse(
                 _D(
                     "Playback failed for song `%(song)s` due to an error:\n```\n%(error)s```",
@@ -8590,20 +8642,25 @@ class MusicBot(discord.Client):
             raise
 
         # Catch everything else to keep bugs from bringing down the bot...
-        except Exception:  # pylint: disable=broad-exception-caught
-            log.error(
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            # Always log the traceback and always reply (S4). The traceback used
+            # to be logged only in debug mode, and in debug mode it was posted to
+            # the channel, exposing file paths and internals. It never is now.
+            log.exception(
                 "Exception while handling command: %(command)s",
                 {"command": command},
-                exc_info=self.config.debug_mode,
             )
-            if self.config.debug_mode:
-                er = ErrorResponse(
-                    traceback.format_exc(),
-                    codeblock="text",
-                    title=_D("Exception Error", ssd),
-                    reply_to=message,
+            er = ErrorResponse(
+                _D(
+                    "Something went wrong running `%(command)s` (%(error)s). "
+                    "Details are in the bot's log.",
+                    ssd,
                 )
-                await self.safe_send_message(message.channel, er)
+                % {"command": command, "error": type(e).__name__},
+                title=_D("Exception Error", ssd),
+                reply_to=message,
+            )
+            await self.safe_send_message(message.channel, er)
 
         finally:
             if self.config.delete_invoking:
