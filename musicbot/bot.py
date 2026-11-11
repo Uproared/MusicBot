@@ -69,7 +69,7 @@ from .entry import LocalFilePlaylistEntry, StreamPlaylistEntry, URLPlaylistEntry
 from .filecache import AudioFileCache
 from .i18n import _D, _L, _Dd
 from .logs import muffle_discord_console_log, mute_discord_console_log
-from .opus_loader import load_opus_lib
+from .opus_loader import check_davey_version, load_opus_lib
 from .permissions import PermissionGroup, Permissions, PermissionsDefaults
 from .player import MusicPlayer
 from .playlist import Playlist
@@ -167,6 +167,7 @@ class MusicBot(discord.Client):
         use_certifi: bool = False,
     ) -> None:
         log.info("Initializing MusicBot %s", BOTVERSION)
+        check_davey_version()
         load_opus_lib()
 
         if config_file is None:
