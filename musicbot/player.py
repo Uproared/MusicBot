@@ -855,8 +855,11 @@ class MusicPlayer(EventEmitter, Serializable):
                 type(obj),
             )
             return None
-        except json.JSONDecodeError:
-            log.exception("Failed to deserialize player")
+        except Exception:  # pylint: disable=broad-exception-caught
+            # Not just JSONDecodeError: a stale or hand-edited file can raise
+            # KeyError/TypeError/AttributeError, which used to escape get_player
+            # and break auto-join (B6). Start with an empty queue instead.
+            log.exception("Failed to load the saved queue, starting with an empty one.")
             return None
 
     @property

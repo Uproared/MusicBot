@@ -539,6 +539,11 @@ class Playlist(EventEmitter, Serializable):
         pl = cls(bot)
 
         for entry in raw_json["entries"]:
+            # Entries that couldn't be restored (wrong version, bad data) come
+            # back as None; a None in the queue breaks listing and playback (B6).
+            if entry is None:
+                log.warning("Skipped a saved queue entry that could not be loaded.")
+                continue
             pl.entries.append(entry)
 
         # TODO: create a function to init downloading (since we don't do it here)?

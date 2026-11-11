@@ -1774,8 +1774,13 @@ class MusicBot(discord.Client):
         async with self.aiolocks["queue_serialization" + ":" + str(guild.id)]:
             log.debug("Serializing queue for %s", guild.id)
 
-            with open(path, "w", encoding="utf8") as f:
-                f.write(player.serialize(sort_keys=True))
+            # Write a temp file and swap it in, so a kill mid-write (systemd stop
+            # timeout, OOM) can't leave a truncated queue.json behind (B6).
+            data = player.serialize(sort_keys=True)
+            tmp_path = path.with_name(path.name + ".tmp")
+            with open(tmp_path, "w", encoding="utf8") as f:
+                f.write(data)
+            os.replace(tmp_path, path)
 
     async def deserialize_queue(
         self,
@@ -8532,6 +8537,12 @@ class MusicBot(discord.Client):
                 return
 
             response = await handler(**handler_kwargs)
+
+            # These change the queue without a track event that would save it,
+            # so a restart brought cleared/removed songs back (upstream #2305).
+            if command in ("clear", "remove", "shuffle", "move") and message.guild:
+                await self.serialize_queue(message.guild)
+
             if response and isinstance(response, MusicBotResponse):
                 # Set a default response title if none is set.
                 if not response.title:
