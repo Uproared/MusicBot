@@ -42,13 +42,13 @@ log = logging.getLogger(__name__)
 
 class YtdlpLogHook:
     def debug(self, msg: Any) -> None:
-        """Debug or info level log from yt_dlp"""
-        if msg.startswith("[debug] "):
-            ld = log.debug
-            ld(f"[YTDLP] {msg}")  # pylint: disable=logging-fstring-interpolation
-        else:
-            li = log.info
-            li(f"[YTDLP] {msg}")  # pylint: disable=logging-fstring-interpolation
+        """
+        Debug or info level log from yt_dlp. With a logger attached, yt-dlp
+        sends all its progress output here (extracting, downloading, %), so
+        keep it at DEBUG now that the logger is always attached (S3).
+        """
+        ld = log.debug
+        ld(f"[YTDLP] {msg}")  # pylint: disable=logging-fstring-interpolation
 
     def info(self, msg: Any) -> None:
         """Info level log from yt_dlp"""
@@ -83,7 +83,9 @@ ytdl_format_options_immutable = MappingProxyType(
         "default_search": "auto",
         "source_address": None,
         "usenetrc": True,
-        "no_color": True,
+        # yt-dlp's current form of no_color. The old key made every YoutubeDL
+        # instance after the first warn "Overwriting params from color".
+        "color": "no_color",
         "retries": 1,
     }
 )
@@ -168,13 +170,17 @@ class Downloader:
                 bot.config.ytdlp_concurrent_frags
             )
 
+        # Always attach the logger, so yt-dlp warnings (no JavaScript runtime,
+        # cookie problems, missing formats) reach the log at any DebugLevel.
+        # They were dropped unless debug mode was on (S3).
+        ytdl_format_options["no_warnings"] = False
+        ytdl_format_options["logger"] = YtdlpLogHook()
         # enable verbose ytdlp logs if debug mode is enabled.
-        if bot.config.debug_mode:
-            ytdl_format_options["no_warnings"] = False
-            ytdl_format_options["logger"] = YtdlpLogHook()
-            # "progress_hooks": [YtdlpLogHook.progress]
-            if bot.config.debug_level <= logging.NOISY:  # type: ignore[attr-defined]
-                ytdl_format_options["verbose"] = True
+        if (
+            bot.config.debug_mode
+            and bot.config.debug_level <= logging.NOISY  # type: ignore[attr-defined]
+        ):
+            ytdl_format_options["verbose"] = True
 
         # check if we should apply a cookies file to ytdlp.
         if bot.config.cookies_path.is_file():
