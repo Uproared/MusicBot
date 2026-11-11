@@ -349,7 +349,7 @@ def test_now_playing_message_is_a_card_with_buttons(bot_cls):
         serialize_queue=_noop,
         safe_send_message=safe_send_message,
         _retire_np_controls=retire,
-        _track_np_controls=lambda g, m, v: tracked.append((m.id, v)),
+        _track_np_controls=lambda g, m, v, e=None: tracked.append((m.id, v, e)),
     )
     fake._np_card = lambda *a, **k: bot_cls._np_card(fake, *a, **k)
     player = _player(cur)
@@ -365,7 +365,8 @@ def test_now_playing_message_is_a_card_with_buttons(bot_cls):
     assert card.title == "Song A"
     assert isinstance(card.view, PlayerControls)
     assert retired == [guild]  # the previous card lost its buttons first
-    assert tracked == [(99, card.view)]
+    assert tracked == [(99, card.view, cur)]  # the card knows its song
+    assert "🔘" in card.description  # with the progress bar
 
 
 # --- the buttons' bookkeeping --------------------------------------------------
@@ -405,7 +406,10 @@ def test_refresh_stops_the_old_view_before_attaching_the_new_one(bot_cls):
     async def edit(view):
         seen.append((old_view.stopped, view))
 
-    ssd = SimpleNamespace(np_controls_msg=SimpleNamespace(edit=edit), np_controls_view=old_view)
+    ssd = SimpleNamespace(
+        np_controls_msg=SimpleNamespace(edit=edit), np_controls_view=old_view,
+        np_controls_entry=None,
+    )
     player = _player(_entry(), paused=True)
     fake = SimpleNamespace(server_data={1: ssd}, get_player_in=lambda g: player)
 
@@ -808,7 +812,7 @@ def test_help_for_one_command(bot_cls):
 def test_status_shows_the_uploader_under_the_song(bot_cls, monkeypatch):
     fake, calls = _status_bot({1: _player(_entry("Song A", uploader="Some Channel"))})
     _run_status(bot_cls, fake, monkeypatch)
-    assert calls[0][1].state == "Some Channel"
+    assert calls[0][1].state == "Some Channel · 03:24"
 
     fake, calls = _status_bot({1: _player(_entry("Song A"))}, status_message="{p0_title}!")
     _run_status(bot_cls, fake, monkeypatch)
@@ -932,3 +936,116 @@ def test_older_data_files_load_quietly(tmp_path, caplog):
         _run_tasks(tasks, "MB_LoadGuildOptions")
     assert "np_card" not in caplog.text
     assert tasks == []
+
+
+# --- the progress bar keeps moving -------------------------------------------------
+
+
+def _progress_bot(bot_cls, players, ssds, embeds=True):
+    fake = SimpleNamespace(
+        players=players,
+        server_data=ssds,
+        config=SimpleNamespace(
+            embeds=embeds, now_playing_mentions=False, remove_embed_footer=False,
+            footer_text=DEFAULT_FOOTER_TEXT,
+        ),
+        user=SimpleNamespace(name="TestBot", display_avatar=SimpleNamespace(url="https://a")),
+    )
+    fake._np_card = lambda *a, **k: bot_cls._np_card(fake, *a, **k)
+    fake._footer = lambda: bot_cls._footer(fake)
+    fake._np_card_edit = lambda *a: bot_cls._np_card_edit(fake, *a)
+    return fake
+
+
+def _card_holder(entry, edits, fail=None):
+    async def edit(**kw):
+        if fail is not None:
+            raise fail
+        edits.append(kw)
+
+    return SimpleNamespace(
+        np_controls_msg=SimpleNamespace(edit=edit), np_controls_entry=entry,
+        np_controls_view=None, lang_code="", guild_id=1,
+    )
+
+
+def test_progress_loop_redraws_only_the_playing_songs_card(bot_cls):
+    edits = []
+    playing = _entry("Song A")
+    p1 = _player(playing, progress=95)
+    p2 = _player(_entry("Song B"), paused=True)        # paused: left alone
+    p3 = _player(_entry("Song C"))                     # card is for another song
+    ssds = {
+        1: _card_holder(playing, edits),
+        2: _card_holder(p2.current_entry, edits),
+        3: _card_holder(_entry("Old song"), edits),
+    }
+    fake = _progress_bot(bot_cls, {1: p1, 2: p2, 3: p3}, ssds)
+    asyncio.run(bot_cls._update_np_progress(fake))
+
+    assert len(edits) == 1
+    card = edits[0]["embed"]
+    assert card.title == "Song A"
+    assert "`01:35`" in card.description          # the bar moved to 1:35
+    assert card.footer.text.startswith("TestBot \u00b7 ")  # footer kept
+    assert "view" not in edits[0]                 # buttons untouched
+
+
+def test_progress_loop_forgets_a_deleted_card(bot_cls):
+    class _Resp:
+        status = 404
+        reason = "Not Found"
+
+    retired = []
+    playing = _entry("Song A")
+    player = _player(playing)
+    player.voice_client = SimpleNamespace(guild=SimpleNamespace(id=1))
+    gone = discord.NotFound(_Resp(), {"code": 10008, "message": "Unknown Message"})
+    fake = _progress_bot(bot_cls, {1: player}, {1: _card_holder(playing, [], fail=gone)})
+
+    async def retire(guild, edit=True):
+        retired.append(edit)
+
+    fake._retire_np_controls = retire
+    asyncio.run(bot_cls._update_np_progress(fake))
+    assert retired == [False]
+
+
+def test_progress_redraw_in_text_mode_edits_the_text(bot_cls):
+    playing = _entry("Song A")
+    fake = _progress_bot(bot_cls, {}, {}, embeds=False)
+    kwargs = bot_cls._np_card_edit(fake, _card_holder(playing, []), _player(playing), playing)
+    assert list(kwargs) == ["content"]
+    assert "## Song A" in kwargs["content"]
+
+
+def test_pause_redraws_the_card_amber(bot_cls):
+    seen = []
+    playing = _entry("Song A")
+    player = _player(playing, paused=True)
+
+    async def edit(**kw):
+        seen.append(kw)
+
+    ssd = SimpleNamespace(
+        np_controls_msg=SimpleNamespace(edit=edit), np_controls_view=None,
+        np_controls_entry=playing, lang_code="", guild_id=1,
+    )
+    fake = _progress_bot(bot_cls, {}, {1: ssd})
+    fake.get_player_in = lambda g: player
+    asyncio.run(bot_cls.refresh_np_controls(fake, SimpleNamespace(id=1)))
+    card = seen[0]["embed"]
+    assert card.colour == discord.Colour.from_str(MUSICBOT_EMBED_COLOR_PAUSED)
+    assert isinstance(seen[0]["view"], PlayerControls)
+
+
+def test_status_shows_live_for_streams(bot_cls, monkeypatch):
+    from musicbot.entry import StreamPlaylistEntry
+
+    stream = StreamPlaylistEntry.__new__(StreamPlaylistEntry)
+    stream.info = {"uploader": "Radio"}
+    monkeypatch.setattr(StreamPlaylistEntry, "title", property(lambda s: "Live radio"))
+    monkeypatch.setattr(StreamPlaylistEntry, "url", property(lambda s: "https://r.example"))
+    fake, calls = _status_bot({1: _player(stream)})
+    _run_status(bot_cls, fake, monkeypatch)
+    assert calls[0][1].state == "Radio \u00b7 \U0001f534 Live"
