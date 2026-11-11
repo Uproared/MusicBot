@@ -683,3 +683,133 @@ def test_retire_ignores_an_already_deleted_card(bot_cls, caplog):
     with caplog.at_level("DEBUG", logger="musicbot.bot"):
         asyncio.run(bot_cls._retire_np_controls(fake, SimpleNamespace(id=1)))
     assert "Could not remove" not in caplog.text
+
+
+# --- reply headers, errors and help --------------------------------------------
+
+
+def test_command_header_and_groups():
+    from musicbot.player_ui import command_header, group_commands
+
+    assert command_header("skip") == "\u23ed\ufe0f skip"
+    assert command_header("setprefix") == "\u2699\ufe0f setprefix"  # its group's icon
+    assert command_header("skip", error=True) == "\u26a0\ufe0f skip"
+    groups = dict(group_commands(["skip", "play", "queue", "brandnew"]))
+    assert groups["\U0001f3b5 Play"] == ["play"]
+    assert groups["\u23ef\ufe0f Player"] == ["skip"]
+    assert groups["\U0001f4e6 Other"] == ["brandnew"]
+
+
+class _GuildChannel(discord.abc.GuildChannel):
+    def __init__(self, guild):
+        self.guild = guild
+        self.id = 3
+
+
+def _drive_on_message(bot_cls, handler, embeds=True):
+    sent = []
+
+    async def safe_send_message(dest, content):
+        sent.append(content)
+
+    guild = SimpleNamespace(id=1)
+    fake = SimpleNamespace(
+        user=SimpleNamespace(id=42),
+        config=SimpleNamespace(
+            command_prefix="!", commands_via_mention=False, bound_channels=set(),
+            owner_id=1, bot_exception_ids=set(), usealias=False, embeds=embeds,
+            user_blocklist=SimpleNamespace(is_blocked=lambda _u: False),
+            delete_invoking=False,
+        ),
+        server_data={1: SimpleNamespace(command_prefix="!", lang_code="", guild_id=1)},
+        permissions=SimpleNamespace(for_user=lambda _u: SimpleNamespace(
+            ignore_non_voice=set(), can_use_command=lambda c, s="": True, name="Default",
+        )),
+        wait_until_ready=_noop,
+        safe_send_message=safe_send_message,
+        cmd_help=handler,
+    )
+    message = SimpleNamespace(
+        channel=_GuildChannel(guild), guild=guild, content="!help",
+        author=SimpleNamespace(id=7, bot=False),
+    )
+    asyncio.run(bot_cls.on_message(fake, message))
+    return sent[0]
+
+
+def test_command_replies_get_a_header_line(bot_cls):
+    from musicbot.constructs import Response
+
+    async def handler():
+        return Response("hi")
+
+    reply = _drive_on_message(bot_cls, handler)
+    assert reply.author.name == "\u2753 help"
+    assert reply.title is None  # was "**Command:** help"
+
+
+def test_errors_render_as_markdown_in_embeds(bot_cls):
+    async def handler():
+        raise exceptions.CommandError("There are **3** pages.")
+
+    reply = _drive_on_message(bot_cls, handler)
+    assert reply.author.name == "\u26a0\ufe0f help"
+    assert reply.description == "There are **3** pages."  # no code block
+    assert reply.colour == discord.Colour.from_str("#ED4245")
+
+
+def test_errors_keep_the_code_block_in_text_mode(bot_cls):
+    async def handler():
+        raise exceptions.CommandError("No results for @everyone")
+
+    reply = _drive_on_message(bot_cls, handler, embeds=False)
+    assert reply.description == "```text\nNo results for @everyone```"
+
+
+def _help_bot(bot_cls, commands):
+    fake = SimpleNamespace(
+        server_data={},
+        config=SimpleNamespace(command_prefix="!", usealias=False, owner_id=7,
+                               dev_ids=set(), delete_delay_long=60),
+    )
+
+    async def gen_cmd_list(_message, list_all_cmds=False):
+        return list(commands)
+
+    fake.gen_cmd_list = gen_cmd_list
+    fake._help_parts = lambda c, g: bot_cls._help_parts(fake, c, g)
+    fake.cmd_skip = bot_cls.cmd_skip
+    return fake
+
+
+def test_help_lists_commands_by_group(bot_cls):
+    fake = _help_bot(bot_cls, ["skip", "play", "queue", "help"])
+    message = SimpleNamespace(author=SimpleNamespace(id=7))
+    card = asyncio.run(bot_cls.cmd_help(fake, None, message, None))
+    assert card.title == "\u2753 Commands"
+    assert _fields(card) == {
+        "\U0001f3b5 Play": "`play`",
+        "\u23ef\ufe0f Player": "`skip`",
+        "\U0001f4dc Queue": "`queue`",
+        "\u2139\ufe0f Info": "`help`",
+    }
+    assert card.description.startswith("Prefix: `!`")
+
+
+def test_help_for_one_command(bot_cls):
+    fake = _help_bot(bot_cls, [])
+    message = SimpleNamespace(author=SimpleNamespace(id=7))
+    card = asyncio.run(bot_cls.cmd_help(fake, None, message, None, "skip"))
+    assert card.title == "\u23ed\ufe0f skip"
+    assert card.description.startswith("Skip or vote to skip the current playing song.")
+    assert "**Usage**\n```\n!skip [force | f]" in card.description
+
+
+def test_status_shows_the_uploader_under_the_song(bot_cls, monkeypatch):
+    fake, calls = _status_bot({1: _player(_entry("Song A", uploader="Some Channel"))})
+    _run_status(bot_cls, fake, monkeypatch)
+    assert calls[0][1].state == "Some Channel"
+
+    fake, calls = _status_bot({1: _player(_entry("Song A"))}, status_message="{p0_title}!")
+    _run_status(bot_cls, fake, monkeypatch)
+    assert calls[0][1].state is None  # a custom StatusMessage stands alone
