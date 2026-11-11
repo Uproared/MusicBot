@@ -226,7 +226,7 @@ def setup_loggers() -> None:
     # Setup logging for discord module.
     dlogger = logging.getLogger("discord")
     dhandler = logging.FileHandler(
-        filename=DEFAULT_DISCORD_LOG_FILE,
+        filename=write_path(DEFAULT_DISCORD_LOG_FILE),
         encoding="utf-8",
         mode="w",
         delay=True,
